@@ -20,6 +20,7 @@ import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
 import com.bergerkiller.bukkit.common.collections.octree.DoubleOctree;
+import com.bergerkiller.bukkit.common.collections.octree.DoubleOctreeIterator;
 import com.bergerkiller.bukkit.common.math.Quaternion;
 import com.bergerkiller.bukkit.common.wrappers.BlockData;
 
@@ -31,8 +32,10 @@ public class TrackParticleWorld implements CoasterWorldComponent {
     public DoubleOctree<TrackParticle> particles = new DoubleOctree<TrackParticle>();
     public List<TrackParticle> particlesWithoutViewers = new ArrayList<TrackParticle>();
     private final Map<Player, ViewerParticleList> viewers = new ConcurrentHashMap<>(16, 0.75f, 1);
+    private final ArrayList<ParticleWithBlockDistance> particlesSortedList = new ArrayList<>();
     private int updateCtr = 0;
     private boolean forceViewerUpdate = false;
+    private boolean visibleToEveryone = false;
 
     public TrackParticleWorld(CoasterWorld world) {
         this._world = world;
@@ -59,12 +62,24 @@ public class TrackParticleWorld implements CoasterWorldComponent {
         return addParticle(new TrackParticleArmorStandItem(position, orientation, item));
     }
 
+    public TrackParticleDisplayItem addParticleDisplayItem(Vector position, Quaternion orientation, double clip, Vector size, ItemStack item) {
+        return addParticle(new TrackParticleDisplayItem(position, orientation, clip, size, item));
+    }
+
+    public TrackParticleDisplayBlock addParticleDisplayBlock(Vector position, Quaternion orientation, double clip, Vector size, BlockData blockData) {
+        return addParticle(new TrackParticleDisplayBlock(position, orientation, clip, size, blockData));
+    }
+
     public TrackParticleText addParticleTextNoItem(Vector position, String text) {
         return addParticle(new TrackParticleText(position, text, false));
     }
 
     public TrackParticleText addParticleText(Vector position, String text) {
         return addParticle(new TrackParticleText(position, text, true));
+    }
+
+    public TrackParticleSignText addParticleSignText(Vector position, String[][] signLines) {
+        return addParticle(new TrackParticleSignText(position, signLines));
     }
 
     public TrackParticleLine addParticleLine(Vector p1, Vector p2) {
@@ -162,6 +177,18 @@ public class TrackParticleWorld implements CoasterWorldComponent {
     }
 
     /**
+     * Sets whether all particles are visible to everyone. This makes it so that players
+     * that do not have edit permissions or have not activated their TCC editor map ('disabled')
+     * can still see all particles such as wires and levers.
+     *
+     * @param set Whether visible to everyone
+     */
+    public void setVisibleToEveryone(boolean set) {
+        this.visibleToEveryone = set;
+        this.forceViewerUpdate = true;
+    }
+
+    /**
      * Forces a search for new particles around a player.
      * Normally this search only happens when a player moves.
      * 
@@ -196,6 +223,7 @@ public class TrackParticleWorld implements CoasterWorldComponent {
         if (viewer.getWorld() == this.getBukkitWorld()) {
             // Get whether view is in edit mode or not
             boolean isInEditMode = this.getPlugin().getEditState(viewer).getMode() != PlayerEditMode.DISABLED;
+            boolean canViewAllParticles = isInEditMode || this.visibleToEveryone;
 
             // Get state
             ViewerParticleList viewed = this.viewers.computeIfAbsent(viewer, ViewerParticleList::new);
@@ -214,36 +242,80 @@ public class TrackParticleWorld implements CoasterWorldComponent {
             int maxParticles = this.getPlugin().getMaximumParticleCount();
             IntVector3 range_min = viewerBlock.subtract(cuboid_range, cuboid_range, cuboid_range);
             IntVector3 range_max = viewerBlock.add(cuboid_range, cuboid_range, cuboid_range);
-            int numParticles = 0;
+            long timeNow = System.currentTimeMillis();
             boolean reachedLimit = false;
-            for (TrackParticle particle : this.particles.cuboid(range_min, range_max)) {
-                if (!isInEditMode && !particle.isAlwaysVisible()) {
-                    continue;
-                }
+            boolean reachedLimitRecently = (viewed.reachedLimitAt != 0 && (timeNow - viewed.reachedLimitAt) <= 5000);
 
-                if (!particle.isVisible(viewer)) {
-                    continue;
-                }
+            // This runs for the first time, or if we haven't hit a particle limit in a while
+            if (!reachedLimitRecently) {
+                int numParticles = 0;
+                for (TrackParticle particle : this.particles.cuboid(range_min, range_max)) {
+                    if ((!canViewAllParticles && !particle.isAlwaysVisible()) || !particle.isVisible(viewer)) {
+                        continue;
+                    }
 
-                // Limit what can be displayed
-                if (++numParticles > maxParticles) {
-                    reachedLimit = true;
-                    break;
-                }
+                    // Limit what can be displayed
+                    if (++numParticles > maxParticles) {
+                        reachedLimitRecently = true;
+                        reachedLimit = true;
 
-                // Add to the particle mapping. If adding for the first time, make it visible.
-                if (viewed.particles.put(particle, updateObject) == null) {
-                    particle.changeVisibility(viewer, true);
+                        // Reset state, try again
+                        // Changing the updateObject causes it to de-spawn particles we spawned before
+                        updateObject = Integer.valueOf(this.updateCtr++);
+                        numParticles = 0;
+                        break;
+                    }
+
+                    viewed.makeVIsible(viewer, updateObject, particle);
+                }
+            }
+
+            // This runs if there are a lot of particles around the player, and some will need to be trimmed off
+            // This is done by sorting all particles by distance and omitting everything farthest away
+            if (reachedLimitRecently) {
+                ArrayList<ParticleWithBlockDistance> particlesSortedList = this.particlesSortedList;
+                try {
+                    DoubleOctreeIterator<TrackParticle> iter = this.particles.cuboid(range_min, range_max).iterator();
+                    while (iter.hasNext()) {
+                        TrackParticle particle = iter.next();
+                        if ((!isInEditMode && !particle.isAlwaysVisible()) || !particle.isVisible(viewer)) {
+                            continue;
+                        }
+
+                        int dx = Math.abs(viewerBlock.x - iter.getBlockX());
+                        int dy = Math.abs(viewerBlock.y - iter.getBlockY());
+                        int dz = Math.abs(viewerBlock.z - iter.getBlockZ());
+                        int manhattanDistance = dx + dy + dz;
+
+                        particlesSortedList.add(new ParticleWithBlockDistance(particle, manhattanDistance));
+                    }
+
+                    // Sort so that furthest particles are at the end of the list
+                    Collections.sort(particlesSortedList);
+
+                    // Iterate the items, avoid exceeding limit
+                    int numParticles = 0;
+                    for (ParticleWithBlockDistance p : particlesSortedList) {
+                        if (++numParticles > maxParticles) {
+                            reachedLimit = true;
+                            break;
+                        } else {
+                            viewed.makeVIsible(viewer, updateObject, p.particle);
+                        }
+                    }
+                } finally {
+                    particlesSortedList.clear();
                 }
             }
 
             // If limit is reached (for the first time) and not too short of a time passed, send a message
             if (reachedLimit) {
-                long now = System.currentTimeMillis();
-                if (!viewed.reachedLimit && (viewed.reachedLimitAt == 0 || (now - viewed.reachedLimitAt) > 30000)) {
+                if (getPlugin().isMaximumParticleWarningEnabled() && !viewed.reachedLimit &&
+                        (viewed.reachedLimitAt == 0 || (timeNow - viewed.reachedLimitAt) > 30000)
+                ) {
                     viewer.sendMessage(ChatColor.RED + "[TC-Coasters] You have reached the particle limit of " + maxParticles + "!");
                 }
-                viewed.reachedLimitAt = now;
+                viewed.reachedLimitAt = timeNow;
             }
             viewed.reachedLimit = reachedLimit;
 
@@ -331,6 +403,28 @@ public class TrackParticleWorld implements CoasterWorldComponent {
         public long reachedLimitAt = 0;
 
         public ViewerParticleList(Player viewer) {
+        }
+
+        public void makeVIsible(Player viewer, Integer updateObject, TrackParticle particle) {
+            // Add to the particle mapping. If adding for the first time, make it visible.
+            if (particles.put(particle, updateObject) == null) {
+                particle.changeVisibility(viewer, true);
+            }
+        }
+    }
+
+    private static final class ParticleWithBlockDistance implements Comparable<ParticleWithBlockDistance> {
+        public final TrackParticle particle;
+        public final int distance;
+
+        public ParticleWithBlockDistance(TrackParticle particle, int distance) {
+            this.particle = particle;
+            this.distance = distance;
+        }
+
+        @Override
+        public int compareTo(ParticleWithBlockDistance o) {
+            return this.distance - o.distance;
         }
     }
 }

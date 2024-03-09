@@ -7,6 +7,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.Vector;
@@ -127,9 +128,18 @@ public class StringArrayBuffer implements Iterator<String> {
     }
 
     /**
+     * Sets the next UUID value
+     *
+     * @param uuid The UUID value to set
+     */
+    public void putUUID(UUID uuid) {
+        put(uuid.toString());
+    }
+
+    /**
      * Sets the next ItemStack value
      * 
-     * @param item
+     * @param item The ItemStack value to set
      */
     public void putItemStack(ItemStack item) {
         put(jsonSerializer.itemStackToJson(item).replace(" ", "\\u0020"));
@@ -138,16 +148,16 @@ public class StringArrayBuffer implements Iterator<String> {
     /**
      * Sets the next BlockData value
      * 
-     * @param material
+     * @param blockData The BlockData value to set
      */
-    public void putBlockData(BlockData material) {
-        put(material.serializeToString());
+    public void putBlockData(BlockData blockData) {
+        put(blockData.serializeToString());
     }
 
     /**
      * Sets the next IntVector3 value
      * 
-     * @param value to set
+     * @param v The value to set
      */
     public void putIntVector3(IntVector3 v) {
         putInt(v.x);
@@ -158,7 +168,7 @@ public class StringArrayBuffer implements Iterator<String> {
     /**
      * Sets the next Vector value
      * 
-     * @param value to set
+     * @param v The value to set
      */
     public void putVector(Vector v) {
         putDouble(v.getX());
@@ -169,7 +179,7 @@ public class StringArrayBuffer implements Iterator<String> {
     /**
      * Sets the next Double value
      * 
-     * @param value to set
+     * @param value The value to set
      */
     public void putDouble(double value) {
         put(this.numberFormat.format(value));
@@ -178,7 +188,7 @@ public class StringArrayBuffer implements Iterator<String> {
     /**
      * Sets the next Integer value
      * 
-     * @param value to set
+     * @param value The value to set
      */
     public void putInt(int value) {
         put(Integer.toString(value));
@@ -187,7 +197,7 @@ public class StringArrayBuffer implements Iterator<String> {
     /**
      * Sets the next String value
      * 
-     * @param value to set
+     * @param value The value to set
      */
     public void put(String value) {
         set(this.index++, value);
@@ -203,6 +213,21 @@ public class StringArrayBuffer implements Iterator<String> {
     }
 
     /**
+     * Gets the next UUID value, which is a stringified UUID token
+     *
+     * @return next UUID value
+     * @throws SyntaxException If the field value isn't a decodable valid UUID
+     */
+    public UUID nextUUID() throws SyntaxException {
+        String str = next();
+        try {
+            return UUID.fromString(str);
+        } catch (IllegalArgumentException ex) {
+            throw createSyntaxException("Invalid UUID: " + str);
+        }
+    }
+
+    /**
      * Gets the next ItemStack value, which consists of jsonified itemstack properties
      * 
      * @return next ItemStack value
@@ -212,7 +237,7 @@ public class StringArrayBuffer implements Iterator<String> {
         try {
             return this.jsonSerializer.fromJsonToItemStack(next());
         } catch (JsonSyntaxException e) {
-            throw new SyntaxException(-1, this.index+1, "Invalid ItemStack Json(" + e.getMessage() + ")");
+            throw createSyntaxException("Invalid ItemStack Json(" + e.getMessage() + ")");
         }
     }
 
@@ -226,7 +251,7 @@ public class StringArrayBuffer implements Iterator<String> {
         String serialized = next();
         BlockData blockData = BlockData.fromString(serialized);
         if (blockData == null) {
-            throw new SyntaxException(-1, this.index+1, "Unknown block data: " + serialized);
+            throw createSyntaxException("Unknown block data: " + serialized);
         }
         return blockData;
     }
@@ -260,7 +285,7 @@ public class StringArrayBuffer implements Iterator<String> {
     public double nextDouble() throws SyntaxException {
         String value = next();
         if (value.isEmpty()) {
-            throw new SyntaxException(-1, this.index+1, "Empty value, number expected");
+            throw createSyntaxException("Empty value, number expected");
         }
         try {
             return Double.parseDouble(value);
@@ -273,7 +298,7 @@ public class StringArrayBuffer implements Iterator<String> {
                 } catch (NumberFormatException ex2) { /* ignore */ }
             }
 
-            throw new SyntaxException(-1, this.index+1, "Value is not a number: " + value);
+            throw createSyntaxException("Value is not a number: " + value);
         }
     }
 
@@ -286,12 +311,12 @@ public class StringArrayBuffer implements Iterator<String> {
     public int nextInt() throws SyntaxException {
         String value = next();
         if (value.isEmpty()) {
-            throw new SyntaxException(-1, this.index+1, "Empty value, number expected");
+            throw createSyntaxException("Empty value, number expected");
         }
         try {
             return Integer.parseInt(value);
         } catch (NumberFormatException ex) {
-            throw new SyntaxException(-1, this.index+1, "Value is not a number: " + value);
+            throw createSyntaxException("Value is not a number: " + value);
         }
     }
 
@@ -318,13 +343,24 @@ public class StringArrayBuffer implements Iterator<String> {
     }
 
     /**
-     * Checks whether a next String value is available
+     * Checks whether a next String value is available.
+     * If false, all upcoming values are empty strings / unavailable.
      * 
      * @return True if a next String value is available
      */
     @Override
     public boolean hasNext() {
-        return has(this.index);
+        return this.index < this.size;
+    }
+
+    /**
+     * Checks whether the next value is available, and not an empty String
+     *
+     * @return True if a next non-empty value is available
+     * @see #has(int)
+     */
+    public boolean isNextNotEmpty() {
+        return has(index);
     }
 
     /**

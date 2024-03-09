@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.bergerkiller.bukkit.coasters.csv.TrackCSV.SignEntry;
 import com.bergerkiller.bukkit.coasters.objects.TrackObject;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectHolder;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectType;
@@ -20,7 +21,9 @@ import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnectionState;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeAnimationState;
+import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSign;
 import com.bergerkiller.bukkit.coasters.util.StringArrayBuffer;
+import com.bergerkiller.bukkit.coasters.util.TrailingNewLineTrimmingWriter;
 import com.bergerkiller.mountiplex.reflection.util.UniqueHash;
 import com.opencsv.CSVWriter;
 
@@ -39,13 +42,14 @@ public class TrackCSVWriter implements AutoCloseable {
     private final UniqueHash writtenItemNameHash = new UniqueHash();
     private final AtomicInteger adjustCounter = new AtomicInteger(0);
     private boolean writeLinksToForeignNodes = true;
+    private boolean writeSignKeys = false;
 
     public TrackCSVWriter(OutputStream outputStream) {
         this(outputStream, ',');
     }
 
     public TrackCSVWriter(OutputStream outputStream, char separator) {
-        java.io.Writer writer = new java.io.OutputStreamWriter(outputStream, StandardCharsets.UTF_8);
+        java.io.Writer writer = new TrailingNewLineTrimmingWriter(new java.io.OutputStreamWriter(outputStream, StandardCharsets.UTF_8));
         char quotechar = '"';
         char escapechar = '\\';
         String lineEnd = "\r\n";
@@ -60,6 +64,18 @@ public class TrackCSVWriter implements AutoCloseable {
      */
     public void setWriteLinksToForeignNodes(boolean write) {
         this.writeLinksToForeignNodes = write;
+    }
+
+    /**
+     * Sets whether to write out the UUID keys of all signs used in the coaster.
+     * By default, only writes them out when they have animation states where
+     * it's important to preserve sign identities.
+     * Should be set when saving coasters persistently to disk.
+     *
+     * @param write Whether to write all sign keys
+     */
+    public void setWriteSignKeys(boolean write) {
+        this.writeSignKeys = write;
     }
 
     @Override
@@ -174,8 +190,8 @@ public class TrackCSVWriter implements AutoCloseable {
     /**
      * Writes a new chain of CSV entries starting iteration from a start node.
      * 
-     * @param startNode
-     * @param rootsOnly whether to only write out nodes with one or less neighbours
+     * @param startNode Node to start a new chain from
+     * @param mode Mode of operation when writing out the nodes
      */
     public void writeFrom(TrackNode startNode, Mode mode) throws IOException {
         TrackNode previous = null;
@@ -237,6 +253,7 @@ public class TrackCSVWriter implements AutoCloseable {
             }
             node_entry.setFromNode(startNode);
             this.write(node_entry);
+            this.writeAllSigns(startNode.getSigns(), writeSignKeys || startNode.hasAnimationStates());
 
             // If any exist, add animation node state entries
             boolean saveConnections = startNode.doAnimationStatesChangeConnections();
@@ -245,6 +262,7 @@ public class TrackCSVWriter implements AutoCloseable {
                 anim_entry.name = animState.name;
                 anim_entry.setFromState(animState.state);
                 this.write(anim_entry);
+                this.writeAllSigns(animState.state.signs, true);
                 if (saveConnections) {
                     for (TrackConnectionState ref : animState.connections) {
                         this.writeAllObjects(ref);
@@ -341,6 +359,15 @@ public class TrackCSVWriter implements AutoCloseable {
             object_entry.flipped = object.isFlipped();
             object_entry.name = writeTrackObjectType(object.getType());
             this.write(object_entry);
+        }
+    }
+
+    private void writeAllSigns(TrackNodeSign[] signs, boolean writeKeys) throws IOException {
+        for (TrackNodeSign sign : signs) {
+            SignEntry entry = new SignEntry();
+            entry.sign = sign;
+            entry.writeKeys = writeKeys;
+            this.write(entry);
         }
     }
 

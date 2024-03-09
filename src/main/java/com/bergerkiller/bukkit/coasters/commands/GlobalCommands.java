@@ -24,7 +24,6 @@ import cloud.commandframework.annotations.CommandPermission;
 @CommandMethod("tccoasters|tcc")
 class GlobalCommands {
 
-    @CommandRequiresTCCPermission
     @CommandMethod("")
     @CommandDescription("Shows help")
     public void commandRootHelp(
@@ -32,8 +31,12 @@ class GlobalCommands {
             final TCCoasters plugin
     ) {
         sender.sendMessage("This command is for TC-Coasters, a TrainCarts add-on");
-        sender.sendMessage("/tcc help - Show help information");
-        sender.sendMessage("/tcc give - Give player the editor map");
+        if (plugin.hasUsePermission(sender)) {
+            sender.sendMessage("/tcc help - Show help information");
+            sender.sendMessage("/tcc give - Give player the editor map");
+        } else {
+            sender.sendMessage(ChatColor.RED + "You do not have permission to use TC-Coasters. Ask an Admin.");
+        }
     }
 
     @CommandRequiresTCCPermission
@@ -104,17 +107,6 @@ class GlobalCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("build")
-    @CommandDescription("Rebuilds the track data, might sometimes fix things")
-    public void commandBuild(
-            final CommandSender sender,
-            final TCCoasters plugin
-    ) {
-        sender.sendMessage("Rebuilding tracks");
-        plugin.buildAll();
-    }
-
-    @CommandRequiresTCCPermission
     @CommandMethod("smoothness")
     @CommandDescription("Gets the track smoothness value")
     public void commandGetSmoothness(
@@ -134,7 +126,7 @@ class GlobalCommands {
     ) {
         plugin.setSmoothness(value);
         sender.sendMessage("Set smoothness to " + plugin.getSmoothness() + ", rebuilding tracks");
-        plugin.buildAll();
+        plugin.rebuildAll();
     }
 
     @CommandRequiresTCCPermission

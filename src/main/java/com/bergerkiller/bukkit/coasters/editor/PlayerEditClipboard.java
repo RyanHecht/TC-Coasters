@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSignKey;
 import org.bukkit.entity.Player;
 
 import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
@@ -103,6 +104,20 @@ public class PlayerEditClipboard {
             return;
         }
 
+        // Before pasting, randomize the UUID keys of all signs included
+        {
+            Map<TrackNodeSignKey, TrackNodeSignKey> signKeyRemapping = new HashMap<>();
+            for (TrackNodeState node_state : this._nodes) {
+                TrackNodeAnimationState[] animations = this._animations.get(node_state);
+                node_state.randomizeSignKeys(signKeyRemapping);
+                if (animations != null) {
+                    for (TrackNodeAnimationState anim : animations) {
+                        anim.state.randomizeSignKeys(signKeyRemapping);
+                    }
+                }
+            }
+        }
+
         // Get origin transformation to apply
         Matrix4x4 transform = this._origin.getTransformTo(PlayerOrigin.getForPlayer(this._state.getPlayer()));
 
@@ -114,11 +129,11 @@ public class PlayerEditClipboard {
         try {
             // Create nodes
             for (TrackNodeState node_state : this._nodes) {
+                TrackNodeAnimationState[] animations = this._animations.get(node_state);
                 TrackNode node = coaster.createNewNode(node_state.transform(transform));
                 history.addChangeCreateNode(getPlayer(), node);
 
                 // Assign animations for this node
-                TrackNodeAnimationState[] animations = this._animations.get(node_state);
                 if (animations != null) {
                     for (TrackNodeAnimationState anim : animations) {
                         TrackConnectionState[] connections = new TrackConnectionState[anim.connections.length];
@@ -128,6 +143,9 @@ public class PlayerEditClipboard {
                         node.setAnimationState(anim.name, anim.state.transform(transform), connections);
                     }
                 }
+
+                // Perms!
+                node.checkPowerPermissions(getPlayer());
             }
 
             // Create connections

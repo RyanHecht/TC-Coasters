@@ -1,6 +1,7 @@
 package com.bergerkiller.bukkit.coasters.editor;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
@@ -12,6 +13,7 @@ import com.bergerkiller.bukkit.coasters.TCCoastersLocalization;
 import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
 import com.bergerkiller.bukkit.coasters.editor.object.ui.TypePositionMenu;
 import com.bergerkiller.bukkit.coasters.editor.object.ui.TypeSelectMenu;
+import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
 import com.bergerkiller.bukkit.common.events.map.MapStatusEvent;
@@ -72,7 +74,7 @@ public enum PlayerEditMode {
      * Creates the menu for an edit mode in the editor map
      * 
      * @param tab The tab view to fill with widgets
-     * @param state The edit state of the player
+     * @param stateSupplier Supplier for the edit state of the player
      */
     public void createView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
         this._createViewMethod.accept(tab, stateSupplier);
@@ -128,12 +130,16 @@ public enum PlayerEditMode {
             y += ADJ_BTN_HEIGHT;
 
             tab.addWidget(new MapWidgetButton() {
-                boolean hasCurvedNodeConnections = false;
+                boolean hasSelectedJunction = false;
+                boolean hasSelectedEndNode = false;
+                boolean hasSelectedCurvedNodes = false;
+                boolean hasSelectedStraightNodes = false;
+                boolean makeStraight = true;
 
                 @Override
                 public void onAttached() {
                     super.onAttached();
-                    hasCurvedNodeConnections = stateSupplier.get().hasCurvedConnectionTrackNodes();
+                    checkSelectedNodes();
                     updateText();
                 }
 
@@ -142,7 +148,7 @@ public enum PlayerEditMode {
                     super.onStatusChanged(event);
 
                     if (event.getName().equals("Editor::EditedNodes::Changed")) {
-                        hasCurvedNodeConnections = stateSupplier.get().hasCurvedConnectionTrackNodes();
+                        checkSelectedNodes();
                         updateText();
                     }
                 }
@@ -150,22 +156,58 @@ public enum PlayerEditMode {
                 @Override
                 public void onActivate() {
                     try {
-                        boolean newState = !hasCurvedNodeConnections;
-                        if (hasCurvedNodeConnections) {
+                        boolean newMakeStraight = !makeStraight;
+                        if (makeStraight) {
                             stateSupplier.get().makeConnectionsStraight();
                         } else {
                             stateSupplier.get().makeConnectionsCurved();
                         }
                         getDisplay().playSound(SoundEffect.CLICK);
-                        hasCurvedNodeConnections = newState;
+                        makeStraight = newMakeStraight;
                         updateText();
                     } catch (ChangeCancelledException ex) {
                         getDisplay().playSound(SoundEffect.EXTINGUISH);
                     }
                 }
 
+                private void checkSelectedNodes() {
+                    hasSelectedJunction = false;
+                    hasSelectedEndNode = false;
+                    hasSelectedCurvedNodes = false;
+                    hasSelectedStraightNodes = false;
+                    for (TrackNode node : stateSupplier.get().getEditedNodes()) {
+                        List<TrackConnection> connections = node.getConnections();
+                        if (connections.size() <= 1) {
+                            hasSelectedEndNode = true;
+                        } else if (connections.size() >= 3) {
+                            hasSelectedJunction = true;
+                        } else if (connections.get(0).isZeroLength() || connections.get(1).isZeroLength()) {
+                            hasSelectedStraightNodes = true;
+                        } else {
+                            hasSelectedCurvedNodes = true;
+                        }
+                    }
+                    if (hasSelectedCurvedNodes && !hasSelectedStraightNodes) {
+                        makeStraight = true;
+                    } else if (!hasSelectedCurvedNodes && hasSelectedStraightNodes) {
+                        makeStraight = false;
+                    }
+                }
+
                 private void updateText() {
-                    this.setText(hasCurvedNodeConnections ? "Make Straight" : "Make Curved");
+                    if (hasSelectedCurvedNodes || hasSelectedStraightNodes) {
+                        this.setEnabled(true);
+                        this.setText(makeStraight ? "Make Straight" : "Make Curved");
+                    } else if (hasSelectedJunction) {
+                        this.setEnabled(false);
+                        this.setText("Junction");
+                    } else if (hasSelectedEndNode) {
+                        this.setEnabled(false);
+                        this.setText("End Node");
+                    } else {
+                        this.setEnabled(false);
+                        this.setText("No Selection");
+                    }
                 }
             }).setBounds(10, y, 96, ADJ_BTN_HEIGHT);
 
@@ -363,7 +405,7 @@ public enum PlayerEditMode {
                 }
             }
         });
-        removeButton.setBounds(62, 36, 43, 12);
+        removeButton.setBounds(62, 34, 43, 12);
 
         final MapWidgetSubmitText renameNodeAskText = tab.addWidget(new MapWidgetSubmitText() {
             @Override
@@ -481,12 +523,13 @@ public enum PlayerEditMode {
     }
 
     private static void createTrackObjectsView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
-        tab.addWidget(new TypeSelectMenu(stateSupplier)).setBounds(40, 0, 36, 36);
+        final TypeSelectMenu typeSelector = new TypeSelectMenu(stateSupplier);
+        tab.addWidget(typeSelector).setBounds(40, 0, 36, 36);
 
         tab.addWidget(new MapWidgetButton() {
             @Override
             public void onActivate() {
-                tab.addWidget(new TypePositionMenu(stateSupplier));
+                typeSelector.getSelectedType().openPositionMenu(tab, stateSupplier);
             }
         }).setText("Position").setBounds(26, 40, 64, 13);
 

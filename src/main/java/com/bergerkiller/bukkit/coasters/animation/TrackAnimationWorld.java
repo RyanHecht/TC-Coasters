@@ -20,10 +20,12 @@ import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
 import com.bergerkiller.bukkit.common.entity.CommonEntity;
 import com.bergerkiller.bukkit.common.math.Quaternion;
+import com.bergerkiller.bukkit.common.offline.OfflineBlock;
+import com.bergerkiller.bukkit.common.offline.OfflineWorld;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
-import com.bergerkiller.bukkit.tc.cache.RailMemberCache;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import com.bergerkiller.bukkit.tc.controller.components.RailPath;
+import com.bergerkiller.bukkit.tc.rails.RailLookup;
 
 /**
  * Tracks the running node animations and makes sure trains move along with them
@@ -47,6 +49,7 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
         _animations.put(node, new TrackAnimation(node, target, connections, MathUtil.floor(duration * 20.0)));
     }
 
+    @Override
     public void updateAll() {
         if (_animations.isEmpty()) {
             return;
@@ -145,6 +148,11 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
 
         // Compute new position on the new, adjusted tracks
         for (TrackMemberState state : members.values()) {
+            // Skip unloaded/dead members
+            if (state.member.isUnloaded() || state.member.getEntity().isRemoved()) {
+                continue;
+            }
+
             // Compute the points of connections, cache them for if multiple members are on one
             List<RailPath.Point> points = connectionPoints.get(state.connection);
             if (points.isEmpty()) {
@@ -187,6 +195,12 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
                 p_prev = p;
             }
         }
+
+        // After moving the nodes around again, also rebuild the track information
+        // This is basically done twice per tick when animations play, because it needs
+        // track information prior to calculate where members are, and after to make
+        // sure physics update correctly.
+        this.getWorld().getTracks().updateAll();
     }
 
     private void loadPoints(TrackConnection connection) {
@@ -203,18 +217,19 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
      * @return list of members on the connection
      */
     private Stream<TrackMemberState> findMembersOn(TrackConnection connection) {
-        IntVector3 rail_a = connection.getNodeA().getRailBlock(true);
-        IntVector3 rail_b = connection.getNodeB().getRailBlock(true);
+        OfflineWorld world = getOfflineWorld();
+        OfflineBlock rail_a = world.getBlockAt(connection.getNodeA().getRailBlock(true));
+        OfflineBlock rail_b = world.getBlockAt(connection.getNodeB().getRailBlock(true));
         Stream<MinecartMember<?>> members;
         if (rail_a.equals(rail_b)) {
-            Collection<MinecartMember<?>> members_a = RailMemberCache.findAll(rail_a.toBlock(this.getBukkitWorld()));
+            Collection<MinecartMember<?>> members_a = RailLookup.findMembersOnRail(rail_a);
             if (members_a.isEmpty()) {
                 return Stream.empty();
             }
             members = members_a.stream();
         } else {
-            Collection<MinecartMember<?>> members_a = RailMemberCache.findAll(rail_a.toBlock(this.getBukkitWorld()));
-            Collection<MinecartMember<?>> members_b = RailMemberCache.findAll(rail_b.toBlock(this.getBukkitWorld()));
+            Collection<MinecartMember<?>> members_a = RailLookup.findMembersOnRail(rail_a);
+            Collection<MinecartMember<?>> members_b = RailLookup.findMembersOnRail(rail_b);
             if (members_a.isEmpty() && members_b.isEmpty()) {
                 return Stream.empty();
             }
@@ -237,6 +252,10 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
     }
 
     private static TrackMemberState computeState(MinecartMember<?> member, TrackConnection connection, List<RailPath.Point> points, double total_len) {
+        if (member.isUnloaded() || member.getEntity().isRemoved()) {
+            return new TrackMemberState(member, connection, 0.0);
+        }
+
         Vector pos = member.getEntity().loc.vector();
         Iterator<RailPath.Point> p_iter = points.iterator();
         RailPath.Point p_prev = p_iter.next();

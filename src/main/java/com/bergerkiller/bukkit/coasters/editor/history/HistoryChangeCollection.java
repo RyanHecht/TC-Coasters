@@ -3,9 +3,12 @@ package com.bergerkiller.bukkit.coasters.editor.history;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import org.bukkit.entity.Player;
 
+import com.bergerkiller.bukkit.coasters.TCCoastersLocalization;
+import com.bergerkiller.bukkit.coasters.TCCoastersPermissions;
 import com.bergerkiller.bukkit.coasters.events.CoasterAfterChangeNodeEvent;
 import com.bergerkiller.bukkit.coasters.events.CoasterAfterChangeTrackObjectEvent;
 import com.bergerkiller.bukkit.coasters.events.CoasterBeforeChangeNodeEvent;
@@ -20,9 +23,11 @@ import com.bergerkiller.bukkit.coasters.objects.TrackObject;
 import com.bergerkiller.bukkit.coasters.tracks.TrackCoaster;
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
+import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSign;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeState;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
 import com.bergerkiller.bukkit.common.utils.CommonUtil;
+import com.bergerkiller.bukkit.common.utils.LogicUtil;
 
 /**
  * Base class that makes it easier to create and add new changes
@@ -30,11 +35,12 @@ import com.bergerkiller.bukkit.common.utils.CommonUtil;
 public abstract class HistoryChangeCollection {
 
     /**
-     * Adds a change to be performed after this change is performed ({@link #redo()}).
+     * Adds a change to be performed after this change is performed.
      * When undoing, the child changes are performed in reverse order beforehand.
-     * 
+     *
      * @param change to add
      * @return change added
+     * @see com.bergerkiller.bukkit.coasters.editor.PlayerEditHistory PlayerEditHistory
      */
     public abstract HistoryChange addChange(HistoryChange change);
 
@@ -140,6 +146,21 @@ public abstract class HistoryChangeCollection {
     public final HistoryChange addChangeCreateNode(Player who, TrackNode node) throws ChangeCancelledException {
         try {
             handleEvent(new CoasterCreateNodeEvent(who, node));
+
+            // Also check permission to create signs
+            if (node.getSigns().length > 0) {
+                if (!TCCoastersPermissions.MAKE_SIGNS.has(who)) {
+                    TCCoastersLocalization.SIGNS_NO_PERMISSION.message(who);
+                    node.setSigns(TrackNodeSign.EMPTY_ARR);
+                } else {
+                    TrackNodeSign[] filtered = Stream.of(node.getSigns())
+                            .filter(s -> s.fireBuildEvent(who, false))
+                            .toArray(TrackNodeSign[]::new);
+                    if (filtered.length != node.getSigns().length) {
+                        node.setSigns(filtered);
+                    }
+                }
+            }
         } catch (ChangeCancelledException ex) {
             node.remove();
             throw ex;
@@ -151,6 +172,26 @@ public abstract class HistoryChangeCollection {
         handleEvent(new CoasterBeforeChangeNodeEvent(who, node));
         TrackNodeState old_state = node.getState();
         TrackNodeState new_state = old_state.changeRail(new_rail);
+        return addChange(new HistoryChangeNode(node.getWorld(), old_state, new_state));
+    }
+
+    public final HistoryChange addChangeBeforeAddSign(Player who, TrackNode node, TrackNodeSign new_sign) throws ChangeCancelledException {
+        return addChangeBeforeSetSigns(who, node, LogicUtil.appendArrayElement(node.getSigns(), new_sign));
+    }
+
+    public void handleChangeAfterSetSigns(Player who, TrackNode node, TrackNodeSign[] old_signs) throws ChangeCancelledException {
+        TrackNodeState old_state = node.getState().changeSigns(old_signs);
+        handleEvent(new CoasterAfterChangeNodeEvent(who, node, old_state));
+    }
+
+    public final HistoryChange addChangeBeforeSetSigns(Player who, TrackNode node, TrackNodeSign[] new_signs) throws ChangeCancelledException {
+        if (!TCCoastersPermissions.MAKE_SIGNS.has(who)) {
+            TCCoastersLocalization.SIGNS_NO_PERMISSION.message(who);
+            throw new ChangeCancelledException();
+        }
+        handleEvent(new CoasterBeforeChangeNodeEvent(who, node));
+        TrackNodeState old_state = node.getState();
+        TrackNodeState new_state = old_state.changeSigns(LogicUtil.cloneAll(new_signs, TrackNodeSign::clone));
         return addChange(new HistoryChangeNode(node.getWorld(), old_state, new_state));
     }
 

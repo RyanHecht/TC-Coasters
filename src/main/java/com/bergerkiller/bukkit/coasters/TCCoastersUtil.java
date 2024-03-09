@@ -3,6 +3,8 @@ package com.bergerkiller.bukkit.coasters;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -13,7 +15,9 @@ import org.bukkit.util.Vector;
 
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
+import com.bergerkiller.bukkit.common.math.Quaternion;
 import com.bergerkiller.bukkit.common.utils.BlockUtil;
+import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.tc.Util;
 import com.bergerkiller.bukkit.tc.controller.components.RailPath;
@@ -25,6 +29,9 @@ import com.bergerkiller.bukkit.tc.rails.type.RailType;
 import com.bergerkiller.generated.net.minecraft.world.level.WorldHandle;
 import com.bergerkiller.generated.net.minecraft.world.phys.AxisAlignedBBHandle;
 import com.bergerkiller.generated.net.minecraft.world.phys.MovingObjectPositionHandle;
+import com.bergerkiller.mountiplex.reflection.declarations.ClassResolver;
+import com.bergerkiller.mountiplex.reflection.declarations.MethodDeclaration;
+import com.bergerkiller.mountiplex.reflection.util.FastMethod;
 
 /**
  * Random stuff used internally that just needs a place
@@ -34,6 +41,9 @@ public class TCCoastersUtil {
     private static final int[] BLOCK_DELTAS_POS = new int[] {0, 1};
     private static final int[] BLOCK_DELTAS_ZER = new int[] {0};
     public static final double OFFSET_TO_SIDE = RailLogicHorizontal.Y_POS_OFFSET;
+
+    /** Threshold for Position vector equals() */
+    private static final double POSITION_EPSILON = 1e-6;
 
     public static int[] getBlockDeltas(double value) {
         if (value > 1e-10) {
@@ -160,9 +170,12 @@ public class TCCoastersUtil {
     }
 
     public static boolean snapToCoasterRails(TrackNode selfNode, Vector position, Vector orientation) {
-        TrackNode zeroNode = selfNode.getZeroDistanceNeighbour();
+        return snapToCoasterRails(selfNode, position, orientation, LogicUtil.alwaysTruePredicate());
+    }
+
+    public static boolean snapToCoasterRails(TrackNode selfNode, Vector position, Vector orientation, Predicate<TrackNode> filter) {
         for (TrackNode nearby : selfNode.getWorld().getTracks().findNodesNear(new ArrayList<TrackNode>(0), position, 0.25)) {
-            if (nearby == selfNode || nearby == zeroNode) {
+            if (nearby == selfNode || !filter.test(nearby)) {
                 continue;
             }
 
@@ -267,11 +280,29 @@ public class TCCoastersUtil {
                 position.setX(p1.posX);
                 position.setY(p1.posY);
                 position.setZ(p1.posZ);
-                Util.setVector(orientation, p1.orientation.upVector());
+                Util.setVector(orientation, readWheelOrientation(p1).upVector());
                 return true;
             }
         }
         return false;
+    }
+
+    private static final FastMethod<Quaternion> readWheelOrientationMethod = new FastMethod<>();
+    static {
+        try {
+            readWheelOrientationMethod.init(RailPath.Position.class.getMethod("getWheelOrientation"));
+        } catch (NoSuchMethodException | SecurityException e) {
+            // Older TrainCarts version. Probably is never used but just in case.
+            ClassResolver resolver = new ClassResolver();
+            resolver.setDeclaredClass(RailPath.Position.class);
+            readWheelOrientationMethod.init(new MethodDeclaration(resolver,
+                    "public com.bergerkiller.bukkit.common.math.Quaternion getWheelOrientation() {\n" +
+                    "    return instance.orientation;\n" +
+                    "}"));
+        }
+    }
+    private static Quaternion readWheelOrientation(RailPath.Position position) {
+        return readWheelOrientationMethod.invoke(position);
     }
 
     /**
@@ -309,5 +340,33 @@ public class TCCoastersUtil {
         public Block block;
         public Vector position;
         public BlockFace face;
+    }
+
+    public static <T> T[] cloneArray(T[] array, UnaryOperator<T> clone) {
+        int len = array.length;
+        if (len == 0) {
+            return array;
+        } else {
+            T[] copy = array.clone();
+            for (int i = 0; i < len; i++) {
+                copy[i] = clone.apply(copy[i]);
+            }
+            return copy;
+        }
+    }
+
+    /**
+     * Checks whether two node positions occupy the exact same position, with an epsilon.
+     * That makes this check fuzzy. <b>It differs from Vector equals which will not
+     * work with custom types</b>
+     *
+     * @param a Position A
+     * @param b Position B
+     * @return True if position A and B are very closely similar (1e-6)
+     */
+    public static boolean isPositionSame(Vector a, Vector b) {
+        return Math.abs(a.getX() - b.getX()) < POSITION_EPSILON &&
+               Math.abs(a.getY() - b.getY()) < POSITION_EPSILON &&
+               Math.abs(a.getZ() - b.getZ()) < POSITION_EPSILON;
     }
 }

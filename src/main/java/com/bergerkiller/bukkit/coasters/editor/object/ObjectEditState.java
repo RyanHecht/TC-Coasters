@@ -3,15 +3,15 @@ package com.bergerkiller.bukkit.coasters.editor.object;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
-import java.util.SortedSet;
-import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
@@ -36,7 +36,7 @@ import com.bergerkiller.bukkit.coasters.events.CoasterSelectTrackObjectEvent;
 import com.bergerkiller.bukkit.coasters.objects.TrackObject;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectType;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectTypeFallingBlock;
-import com.bergerkiller.bukkit.coasters.objects.TrackObjectTypeItemStack;
+import com.bergerkiller.bukkit.coasters.objects.TrackObjectTypeArmorStandItem;
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSearchPath;
@@ -652,14 +652,17 @@ public class ObjectEditState {
 
         // Create new objects when none are selected
         if (this.editedTrackObjects.isEmpty()) {
-            // Compare orientation with the direction the player is looking
-            // If inverted, then flip the object
-            boolean flipped = (point.orientation.rightVector().dot(rightDirection) < 0.0);
-            TrackObject object = new TrackObject(this.getSelectedType(), point.distance, flipped);
-            this.editState.getHistory().addChangeBeforeCreateTrackObject(this.getPlayer(), point.connection, object);
+            // Only do this after the first click
+            if (this.editState.getHeldDownTicks() == 0) {
+                // Compare orientation with the direction the player is looking
+                // If inverted, then flip the object
+                boolean flipped = (point.orientation.rightVector().dot(rightDirection) < 0.0);
+                TrackObject object = new TrackObject(this.getSelectedType(), point.distance, flipped);
+                this.editState.getHistory().addChangeBeforeCreateTrackObject(this.getPlayer(), point.connection, object);
 
-            point.connection.addObject(object);
-            point.connection.saveObjectsToAnimationStates(this.editState.getSelectedAnimation());
+                point.connection.addObject(object);
+                point.connection.saveObjectsToAnimationStates(this.editState.getSelectedAnimation());
+            }
             return;
         }
 
@@ -1277,15 +1280,13 @@ public class ObjectEditState {
                 }
             }
         }
-        return TrackObjectTypeItemStack.createDefault();
+        return TrackObjectTypeArmorStandItem.createDefault();
     }
 
-    private SortedSet<ObjectEditTrackObject> computeDraggedObjects(boolean initialDirection) {
+    private Collection<ObjectEditTrackObject> computeDraggedObjects(boolean initialDirection) {
         // Create a sorted list of objects to move, with drag distance increasing
         // Only add objects with the same direction
-        SortedSet<ObjectEditTrackObject> objects = new TreeSet<ObjectEditTrackObject>(
-            (a, b) -> Double.compare(a.dragDistance, b.dragDistance)
-        );
+        PriorityQueue<ObjectEditTrackObject> objects = new PriorityQueue<>(editedTrackObjects.size(), Comparator.comparingDouble(a -> a.dragDistance));
         for (ObjectEditTrackObject editObject : this.editedTrackObjects.values()) {
             if (editObject.dragDirection == initialDirection && !Double.isNaN(editObject.dragDistance)) {
                 objects.add(editObject);
@@ -1297,7 +1298,7 @@ public class ObjectEditState {
     /// Tests to see if the player changes the cursor enough to indicate the player is moving the objects around
     /// Used to decide whether or not to switch to duplicating mode
     private boolean isMovingObjects(TrackConnection.PointOnPath point, boolean initialDirection) {
-        SortedSet<ObjectEditTrackObject> objects = computeDraggedObjects(initialDirection);
+        Collection<ObjectEditTrackObject> objects = computeDraggedObjects(initialDirection);
         if (objects.isEmpty()) {
             return false; // none in this category
         }
@@ -1337,7 +1338,7 @@ public class ObjectEditState {
 
     /// Moves selected track objects. Direction defines whether to walk to nodeA (false) or nodeB (true).
     private boolean moveObjects(TrackConnection.PointOnPath point, HistoryChange changes, boolean initialDirection, Vector rightDirection) {
-        SortedSet<ObjectEditTrackObject> objects = computeDraggedObjects(initialDirection);
+        Collection<ObjectEditTrackObject> objects = computeDraggedObjects(initialDirection);
         if (objects.isEmpty()) {
             return true; // none in this category
         }

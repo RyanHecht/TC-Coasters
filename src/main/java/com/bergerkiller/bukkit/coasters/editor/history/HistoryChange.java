@@ -12,10 +12,12 @@ import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
  */
 public abstract class HistoryChange extends HistoryChangeCollection {
     private final List<HistoryChange> children = new LinkedList<HistoryChange>();
+    private final long timestamp;
     protected final CoasterWorld world;
 
     public HistoryChange(CoasterWorld world) {
         this.world = world;
+        this.timestamp = System.currentTimeMillis();
     }
 
     /**
@@ -98,5 +100,34 @@ public abstract class HistoryChange extends HistoryChangeCollection {
     @Override
     public boolean hasChanges() {
         return !this.children.isEmpty();
+    }
+
+    /**
+     * Gets whether this historic change is a no-op: It has no effect when undoing
+     * or redoing it.
+     *
+     * @return True if this is a No-Op
+     */
+    public boolean isNOOP() {
+        return false;
+    }
+
+    /**
+     * Gets a milliseconds timestamp of when this history change was created
+     *
+     * @return timestamp of the change
+     * @see System#currentTimeMillis()
+     */
+    public long getTimestamp() {
+        return timestamp;
+    }
+
+    /**
+     * Gets how many seconds ago {@link #getTimestamp()} was
+     *
+     * @return seconds ago this change was
+     */
+    public int getSecondsAgo() {
+        return (int) ((System.currentTimeMillis() - timestamp) / 1000L);
     }
 }

@@ -10,6 +10,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Level;
 
+import com.bergerkiller.bukkit.coasters.TCCoastersUtil;
+import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
+import org.bukkit.entity.Player;
 import org.bukkit.util.FileUtil;
 import org.bukkit.util.Vector;
 
@@ -18,7 +21,6 @@ import com.bergerkiller.bukkit.coasters.csv.TrackCSV;
 import com.bergerkiller.bukkit.coasters.csv.TrackCSVReader;
 import com.bergerkiller.bukkit.coasters.csv.TrackCSVWriter;
 import com.bergerkiller.bukkit.coasters.util.PlayerOrigin;
-import com.bergerkiller.bukkit.coasters.util.SyntaxException;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 
@@ -46,20 +48,23 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
     }
 
     /**
-     * Finds the track node that exists precisely at a particular 3d position
+     * Finds the track node that exists precisely at a particular 3d position.<br>
+     * <br>
+     * If multiple nodes exist at the same position (=zero distance neighbours),
+     * then it will select the orphan node if it has zero connections to other nodes.
+     * This makes sure that when creating links, the 'straightened' effect of the
+     * node is preferred instead of creating random broken junctions.
      * 
-     * @param position
+     * @param position Node position
+     * @param excludedNode If multiple track nodes exist at a position, makes sure to
+     *                     exclude this node. Ignored if null.
      * @return node at the position, null if not found
      */
-    public TrackNode findNodeExact(Vector position) {
-        final double MAX_DIFF = 1e-6;
+    public TrackNode findNodeExact(Vector position, TrackNode excludedNode) {
         for (TrackNode node : this._nodes) {
-            Vector npos = node.getPosition();
-            double dx = Math.abs(npos.getX() - position.getX());
-            double dy = Math.abs(npos.getY() - position.getY());
-            double dz = Math.abs(npos.getZ() - position.getZ());
-            if (dx < MAX_DIFF && dy < MAX_DIFF && dz < MAX_DIFF) {
-                return node;
+            if (TCCoastersUtil.isPositionSame(node.getPosition(), position) && node != excludedNode) {
+                TrackNode orphan = node.selectZeroDistanceOrphan();
+                return (orphan != excludedNode) ? orphan : node;
             }
         }
         return null;
@@ -143,8 +148,6 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
     /**
      * Called from all over the place to indicate that the coaster has been changed.
      * Autosave will kick in at a later time to save this coaster to file again.
-     * 
-     * @param changed
      */
     public void markChanged() {
         this._changed = true;
@@ -196,14 +199,28 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
     }
 
     /**
-     * Loads this coaster's nodes from file and makes all connections contained therein
+     * Loads this coaster's nodes from file and makes all connections contained therein.
      */
     public void load() {
+        loadBase().finishCoaster();
+    }
+
+    /**
+     * Loads this coaster's nodes from file and makes all connections contained therein.
+     * Does not yet load in all the LINK entries, which should be loaded in after all
+     * other coasters are loaded in as well. The returned CoasterLoadFinalizeAction should
+     * be used for that purpose.
+     *
+     * @return CoasterLoadFinalizeAction Action to be run once all coasters are loaded in
+     */
+    public CoasterLoadFinalizeAction loadBase() {
+        CoasterLoadFinalizeAction finalizeAction = () -> {};
+
         // Load the save file. If the save file is not found, but a .tmp file version of it does exist,
         // this indicates saving failed previously inbetween deleting and renaming the .tmp to .csv.
         // We must load the .tmp file instead, then, but also log a warning about this!
         String baseName = TCCoasters.escapeName(this.getName());
-        File folder = this.getWorld().getTracks().getConfigFolder();
+        File folder = this.getWorld().getConfigFolder(false);
         File tmpFile = new File(folder, baseName + ".csv.tmp");
         File realFile = new File(folder, baseName + ".csv");
         if (!realFile.exists()) {
@@ -214,13 +231,22 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
             } else {
                 this.getPlugin().getLogger().log(Level.SEVERE,
                         "Coaster " + this.getName() + " could not be loaded: missing file");
-                return;
+                return finalizeAction;
             }
         }
 
         // Load from file
         try {
-            this.loadFromStream(new FileInputStream(realFile));
+            try (TrackCSVReader reader = new TrackCSVReader(new FileInputStream(realFile))) {
+                reader.setPreserveSignKeys(true);
+                finalizeAction = reader.getFinalizeAction();
+                reader.createBaseOnly(this);
+            } catch (FileNotFoundException e) {
+                this.getPlugin().getLogger().log(Level.SEVERE,
+                        "Failed to find file trying to load coaster " + this.getName());
+            } catch (IOException ex) {
+                throw new CoasterLoadException("An I/O Error occurred while loading coaster " + this.getName(), ex);
+            }
         } catch (CoasterLoadException e) {
             // Log the message
             this.getPlugin().getLogger().log(Level.SEVERE, e.getMessage());
@@ -235,13 +261,12 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
                 // Re-save the coaster right away, to make sure details are still there
                 this.save(false);
             }
-        } catch (FileNotFoundException e) {
-            this.getPlugin().getLogger().log(Level.SEVERE,
-                    "Failed to find file trying to load coaster " + this.getName());
         }
 
         // Coaster loaded. Any post-ops?
         this.markUnchanged();
+
+        return finalizeAction;
     }
 
     /**
@@ -250,38 +275,43 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
      * @param inputStream to read from
      */
     public void loadFromStream(InputStream inputStream) throws CoasterLoadException {
-        this.loadFromStream(inputStream, null);
+        try {
+            this.loadFromStream(inputStream, null, null);
+        } catch (ChangeCancelledException ex) {
+            // Never happens in practise
+            throw new CoasterLoadException("Unexpected ChangeCancelledException", ex);
+        }
     }
 
     /**
      * Loads this coaster by reading CSV data from a reader
      * 
      * @param inputStream to read from
+     * @param player Player that is loading/importing the coaster, for which permissions are checked.
+     *               Null to disable these checks.
      * @param origin relative to which to place the coaster
      */
-    public void loadFromStream(InputStream inputStream, PlayerOrigin origin) throws CoasterLoadException {
+    public void loadFromStream(InputStream inputStream, Player player, PlayerOrigin origin) throws CoasterLoadException, ChangeCancelledException {
         try (TrackCSVReader reader = new TrackCSVReader(inputStream)) {
             reader.setOrigin(origin);
-            reader.create(this);
-
-            // Note: on failure not all nodes may be loaded, but at least some are.
-        } catch (SyntaxException ex) {
-            throw new CoasterLoadException("Syntax error while loading coaster " + this.getName() + " " + ex.getMessage());
+            reader.create(this, player);
+        } catch (CoasterLoadException | ChangeCancelledException ex) {
+            throw ex;
         } catch (IOException ex) {
             throw new CoasterLoadException("An I/O Error occurred while loading coaster " + this.getName(), ex);
         } catch (Throwable t) {
-            t.printStackTrace();
-            throw new CoasterLoadException("An unexpected error occurred while loading coaster " + this.getName(), t);
+            // Just in case the TrackCSVReader constructor somehow throws randomly
+            throw new CoasterLoadException("Unexpected exception occurred loading coaster " + this.getName(), t);
         }
     }
 
     /**
-     * Renames this coaster, renaming the save file and changing {@link #getname()}
+     * Renames this coaster, renaming the save file and changing {@link #getName()}
      *
      * @param newName New name
      */
     public void renameTo(String newName) {
-        File folder = this.getWorld().getTracks().getConfigFolder();
+        File folder = this.getWorld().getConfigFolder(true);
         File oldRealFile = new File(folder, TCCoasters.escapeName(this.getName()) + ".csv");
         File newRealFile = new File(folder, TCCoasters.escapeName(newName) + ".csv");
         oldRealFile.renameTo(newRealFile);
@@ -302,10 +332,11 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
         // Save coaster information to a tmp file first
         boolean success = false;
         String baseName = TCCoasters.escapeName(this.getName());
-        File folder = this.getWorld().getTracks().getConfigFolder();
+        File folder = this.getWorld().getConfigFolder(true);
         File tmpFile = new File(folder, baseName + ".csv.tmp");
         File realFile = new File(folder, baseName + ".csv");
         try (TrackCSVWriter writer = new TrackCSVWriter(new FileOutputStream(tmpFile, false))) {
+            writer.setWriteSignKeys(true);
             if (this.isLocked()) {
                 writer.write(new TrackCSV.LockCoasterEntry());
             }
@@ -357,5 +388,19 @@ public class TrackCoaster implements CoasterWorldComponent, Lockable {
         public CoasterLoadException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    /**
+     * Finishes the creation of a coaster by creating all the connections stored
+     * under LINK entries. This action must run as late as possible so that connections
+     * with other coasters can be facilitated.
+     */
+    @FunctionalInterface
+    public interface CoasterLoadFinalizeAction {
+        /**
+         * Finishes initializing the coaster's links. Is guaranteed to never throw,
+         * but may log problems.
+         */
+        void finishCoaster();
     }
 }

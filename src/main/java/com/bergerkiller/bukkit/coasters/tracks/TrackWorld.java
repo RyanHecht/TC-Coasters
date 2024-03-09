@@ -2,15 +2,14 @@ package com.bergerkiller.bukkit.coasters.tracks;
 
 import java.io.File;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
+import java.util.logging.Level;
 
+import com.bergerkiller.bukkit.coasters.rails.TrackRailsWorld;
 import org.bukkit.Location;
-import org.bukkit.World;
 import org.bukkit.util.Vector;
 
 import com.bergerkiller.bukkit.coasters.TCCoasters;
@@ -18,6 +17,7 @@ import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 import com.bergerkiller.bukkit.common.math.Matrix4x4;
 import com.bergerkiller.bukkit.common.math.Quaternion;
+import com.bergerkiller.bukkit.common.utils.LogicUtil;
 
 /**
  * Stores all the track groups and the special connections between track nodes.
@@ -26,32 +26,17 @@ import com.bergerkiller.bukkit.common.math.Quaternion;
 public class TrackWorld implements CoasterWorldComponent {
     private final CoasterWorld _world;
     private final List<TrackCoaster> _coasters;
-    private final Set<TrackNode> _changedNodes;
-    private final List<TrackNode> _changedNodesLive;
+    private final NodeUpdateList _changedNodes = new NodeUpdateList();
+    private final NodeUpdateList _changedNodesPriority = new NodeUpdateList();
 
     public TrackWorld(CoasterWorld world) {
         this._world = world;
         this._coasters = new ArrayList<TrackCoaster>();
-        this._changedNodes = new HashSet<TrackNode>();
-        this._changedNodesLive = new ArrayList<TrackNode>();
     }
 
     @Override
     public final CoasterWorld getWorld() {
         return this._world;
-    }
-
-    /**
-     * Gets the folder in which coasters and other world-specific data is saved for this world.
-     * This function also ensures that the folder itself exists.
-     * 
-     * @return world config folder
-     */
-    public File getConfigFolder() {
-        World w = this.getBukkitWorld();
-        File f = new File(this.getPlugin().getDataFolder(), w.getName() + "_" + w.getUID());
-        f.mkdirs();
-        return f;
     }
 
     /**
@@ -91,6 +76,57 @@ public class TrackWorld implements CoasterWorldComponent {
             }
         }
         return null;
+    }
+
+    /**
+     * Looks for the node nearest to a point on a path looking at using a given eye
+     * location. If no such node exists, returns null.
+     *
+     * @param eyeLocation
+     * @param fov Field of view factor, 1.0 is default
+     * @param maxDistance Maximum distance away from the eye location to include the results
+     * @return Nearest node result, or null
+     */
+    public TrackNode findNodeLookingAt(Location eyeLocation, double fov, double maxDistance) {
+        // Create an inverted camera transformation of the player's view direction
+        Matrix4x4 cameraTransform = new Matrix4x4();
+        cameraTransform.translateRotate(eyeLocation);
+        return findNodeLookingAt(cameraTransform, fov, maxDistance);
+    }
+
+    /**
+     * Looks for the node nearest to a point on a path looking at using a given eye
+     * location camera transformation matrix. If no such node exists, returns null.
+     *
+     * @param cameraTransform Player eye camera transform
+     * @param fov Field of view factor, 1.0 is default
+     * @param maxDistance Maximum distance away from the eye location to include the results
+     * @return Nearest node result, or null
+     */
+    public TrackNode findNodeLookingAt(Matrix4x4 cameraTransform, double fov, double maxDistance) {
+        Vector startPos = cameraTransform.toVector();
+
+        cameraTransform = cameraTransform.clone();
+        cameraTransform.invert();
+
+        double maxDistSq = maxDistance * maxDistance;
+        double bestViewDistance = Double.MAX_VALUE;
+        TrackNode bestNode = null;
+        for (TrackCoaster coaster : getCoasters()) {
+            for (TrackNode node : coaster.getNodes()) {
+                if (node.getPosition().distanceSquared(startPos) > maxDistSq) {
+                    continue;
+                }
+
+                double viewDistance = getViewDistance(cameraTransform, node.getPosition(), fov);
+                if (viewDistance < bestViewDistance) {
+                    bestViewDistance = viewDistance;
+                    bestNode = node;
+                }
+            }
+        }
+
+        return bestNode;
     }
 
     /**
@@ -219,14 +255,36 @@ public class TrackWorld implements CoasterWorldComponent {
     }
 
     /**
-     * Finds the track node that exists precisely at a particular 3d position
-     * 
-     * @param position
+     * Finds the track node that exists precisely at a particular 3d position.<br>
+     * <br>
+     * If multiple nodes exist at the same position (=zero distance neighbours),
+     * then it will select the orphan node if i has zero connections to other nodes.
+     * This makes sure that when creating links, the 'straightened' effect of the
+     * node is preferred instead of creating random broken junctions.
+     *
+     * @param position Node position
      * @return node at the position, null if not found
      */
     public TrackNode findNodeExact(Vector position) {
+        return findNodeExact(position, null);
+    }
+
+    /**
+     * Finds the track node that exists precisely at a particular 3d position.<br>
+     * <br>
+     * If multiple nodes exist at the same position (=zero distance neighbours),
+     * then it will select the orphan node if i has zero connections to other nodes.
+     * This makes sure that when creating links, the 'straightened' effect of the
+     * node is preferred instead of creating random broken junctions.
+     *
+     * @param position Node position
+     * @param excludedNode If multiple track nodes exist at a position, makes sure to
+     *                     exclude this node. Ignored if null.
+     * @return node at the position, null if not found
+     */
+    public TrackNode findNodeExact(Vector position, TrackNode excludedNode) {
         for (TrackCoaster coaster : this._coasters) {
-            TrackNode node = coaster.findNodeExact(position);
+            TrackNode node = coaster.findNodeExact(position, excludedNode);
             if (node != null) {
                 return node;
             }
@@ -351,17 +409,17 @@ public class TrackWorld implements CoasterWorldComponent {
         if (node.getBukkitWorld() != this.getBukkitWorld()) {
             throw new IllegalArgumentException("Input node is not on world " + this.getBukkitWorld().getName());
         }
-        TrackNode newNode = node.getCoaster().createNewNode(position, node.getOrientation());
+        TrackNode newNode = node.getCoaster().createNewNode(position, node.getOrientation().clone());
         this.addConnection(node, newNode);
         return newNode;
     }
 
     /**
-     * Changes the connections a node has with other nodes. This removes all previous
+     * Resets the connections a node has with other nodes. This removes all previous
      * connections and creates new ones to all the connected nodes specified.
-     * 
-     * @param node
-     * @param connectedNodes
+     *
+     * @param node Node to reset connections of
+     * @param connections New connections of the node
      */
     public void resetConnections(TrackNode node, List<TrackConnectionState> connections) {
         //TODO: Some connections may not change, and this can be optimized!
@@ -383,25 +441,72 @@ public class TrackWorld implements CoasterWorldComponent {
      * @return created connection, null on failure
      */
     public TrackConnection connect(TrackConnectionState state, boolean addObjects) {
-        TrackNode nodeA = state.node_a.findOnWorld(this);
-        TrackNode nodeB = state.node_b.findOnWorld(this);
-        if (nodeA == null || nodeB == null || nodeA == nodeB) {
-            return null;
-        } else {
-            TrackConnection connection = this.connect(nodeA, nodeB);
-            if (addObjects) {
-                connection.addAllObjects(state);
+        TrackNode nodeA, nodeB;
+        if (state.node_a.isExistingNode()) {
+            // If both are specified as an existing node, then do the normal connect() logic
+            if (state.node_b.isExistingNode()) {
+                return connect((TrackNode) state.node_a, (TrackNode) state.node_b);
             }
-            return connection;
+
+            // Try to find an existing connection with node_b reference
+            nodeA = (TrackNode) state.node_a;
+            TrackConnection existing = nodeA.findConnectionWithReference(state.node_b);
+            if (existing != null) {
+                return existing;
+            }
+
+            // Find node_b, if not found, fail
+            if ((nodeB = state.node_b.findOnWorld(this, nodeA)) == null) {
+                return null;
+            }
+        } else if (state.node_b.isExistingNode()) {
+            // Try to find an existing connection with node_a reference
+            nodeB = (TrackNode) state.node_b;
+            TrackConnection existing = nodeB.findConnectionWithReference(state.node_a);
+            if (existing != null) {
+                return existing;
+            }
+
+            // Find node_a, if not found, fail
+            if ((nodeA = state.node_a.findOnWorld(this, nodeB)) == null) {
+                return null;
+            }
+        } else {
+            nodeA = state.node_a.findOnWorld(this, null);
+            nodeB = state.node_b.findOnWorld(this, nodeA);
+
+            // Either node not found, fail
+            if (nodeA == null || nodeB == null) {
+                return null;
+            }
+
+            // Before proceeding, check whether there is a zero-distance neighbour of the nodes
+            // that connects with the other nodes/zero-distance neighbour of that node
+            // This avoids a bunch of weird situations where junctions come into existence.
+            for (TrackNode nodeAZ : nodeA.getNodesAtPosition()) {
+                for (TrackNode nodeBZ : nodeB.getNodesAtPosition()) {
+                    TrackConnection existing = nodeAZ.findConnectionWithNode(nodeBZ);
+                    if (existing != null) {
+                        return existing;
+                    }
+                }
+            }
         }
+
+        // Create a new connection
+        TrackConnection connection = this.addConnection(nodeA, nodeB);
+        if (addObjects) {
+            connection.addAllObjects(state);
+        }
+        return connection;
     }
 
     /**
-     * Connects two track nodes together
+     * Connects two track nodes together, unless the two nodes are already connected together
      * 
-     * @param nodeA
-     * @param nodeB
-     * @return connection
+     * @param nodeA Node A
+     * @param nodeB Node B
+     * @return connection that was found or created
      */
     public TrackConnection connect(TrackNode nodeA, TrackNode nodeB) {
         // Let's not do this
@@ -416,9 +521,10 @@ public class TrackWorld implements CoasterWorldComponent {
             throw new IllegalArgumentException("Input nodeB was deleted and does not exist");
         }
         // Verify no such connection exists yet
-        for (TrackConnection connection : nodeA._connections) {
-            if (connection.isConnected(nodeB)) {
-                return connection;
+        {
+            TrackConnection existing = nodeA.findConnectionWithNode(nodeB);
+            if (existing != null) {
+                return existing;
             }
         }
         // Safety!
@@ -434,26 +540,64 @@ public class TrackWorld implements CoasterWorldComponent {
 
     /**
      * Disconnects two track nodes, removing any existing connection between them
+     *
+     * @param state TrackConnectionState describing the connection between two nodes
+     * @return True if removed, False if the connection could not be found and
+     *         was not removed
+     */
+    public boolean disconnect(TrackConnectionState state) {
+        TrackConnection connection = state.findOnWorld(this);
+        return connection != null && disconnect(connection);
+    }
+
+    /**
+     * Disconnects two track nodes, removing any existing connection between them
      * 
      * @param nodeA
      * @param nodeB
+     * @return True if removed, False if the connection could not be found and
+     *         was not removed
      */
-    public void disconnect(TrackNode nodeA, TrackNode nodeB) {
+    public boolean disconnect(TrackNode nodeA, TrackNode nodeB) {
         if (nodeA == nodeB) {
-            return; // Ignore
+            return false; // Ignore
         }
 
         // Find the connection in nodeA
         for (TrackConnection connection : nodeA._connections) {
             if (connection.isConnected(nodeB)) {
-                removeConnectionFromNode(nodeA, connection);
-                removeConnectionFromNode(nodeB, connection);
-                scheduleNodeRefresh(nodeA);
-                scheduleNodeRefresh(nodeB);
-                connection.onRemoved();
-                connection.markChanged();
-                return; // Done
+                disconnect(connection);
+                return true; // Done
             }
+        }
+
+        // Not found
+        return false;
+    }
+
+    /**
+     * Disconnects a connection that was previously created
+     *
+     * @param connection
+     * @return True if the connection was broken. False if the connection didn't exist.
+     * @see TrackConnection#remove()
+     */
+    public boolean disconnect(TrackConnection connection) {
+        if (connection.getWorld() != _world) {
+            throw new IllegalArgumentException("Connection is not on this world");
+        }
+        TrackNode nodeA = connection.getNodeA();
+        TrackNode nodeB = connection.getNodeB();
+        boolean disconnectedNodeA = removeConnectionFromNode(nodeA, connection);
+        boolean disconnectedNodeB = removeConnectionFromNode(nodeB, connection);
+        if (disconnectedNodeA || disconnectedNodeB) {
+            scheduleNodeRefresh(nodeA);
+            scheduleNodeRefresh(nodeB);
+            connection.onRemoved();
+            connection.markChanged();
+            return true;
+        } else {
+            return false;
         }
     }
 
@@ -527,8 +671,8 @@ public class TrackWorld implements CoasterWorldComponent {
         }
         this._coasters.clear();
         this._changedNodes.clear();
-
-        this.getWorld().getRails().clear();
+        this._changedNodesPriority.clear();
+        this.rebuild();
     }
 
     /**
@@ -539,81 +683,136 @@ public class TrackWorld implements CoasterWorldComponent {
 
         // List all coasters saved on disk. List both .csv and .csv.tmp coasters.
         HashSet<String> coasterNames = new HashSet<String>();
-        for (File coasterFile : this.getConfigFolder().listFiles()) {
-            String name = coasterFile.getName().toLowerCase(Locale.ENGLISH);
-            if (name.endsWith(".csv.tmp")) {
-                coasterNames.add(TCCoasters.unescapeName(name.substring(0, name.length() - 8)));
-            } else if (name.endsWith(".csv")) {
-                coasterNames.add(TCCoasters.unescapeName(name.substring(0, name.length() - 4)));
+        File[] filesInFolder = this.getWorld().getConfigFolder().listFiles();
+        if (filesInFolder != null) {
+            for (File coasterFile : filesInFolder) {
+                String name = coasterFile.getName();
+                if (name.endsWith(".csv.tmp")) {
+                    coasterNames.add(TCCoasters.unescapeName(name.substring(0, name.length() - 8)));
+                } else if (name.endsWith(".csv")) {
+                    coasterNames.add(TCCoasters.unescapeName(name.substring(0, name.length() - 4)));
+                }
             }
         }
 
-        // Build and load all coasters
+        // Build and load the base of all coasters
+        List<TrackCoaster.CoasterLoadFinalizeAction> finalizeActions = new ArrayList<>(coasterNames.size());
         for (String name : coasterNames) {
             TrackCoaster coaster = new TrackCoaster(this.getWorld(), name);
             this._coasters.add(coaster);
-            coaster.load();
+            finalizeActions.add(coaster.loadBase());
         }
+
+        // Now all coasters are loaded in, create all the inter-coaster and junction connections
+        finalizeActions.forEach(TrackCoaster.CoasterLoadFinalizeAction::finishCoaster);
 
         // Mark all coasters as unchanged
         for (TrackCoaster coaster : this._coasters) {
             coaster.refreshConnections();
             coaster.markUnchanged();
         }
+
+        // Apply pending node changes and rebuild all track-rail information
+        rebuild();
+    }
+
+    /**
+     * Updates all nodes that have changed and rebuilds all track information
+     * of {@link TrackRailsWorld}
+     */
+    public void rebuild() {
+        // Ensure all updates have been notified/completed
+        this._changedNodesPriority.clear(); // At this stage this shouldn't even contain elements
+        runAllUpdates(this._changedNodes, false);
+
+        // Rebuild all rail-tracked information of all nodes on this world
+        {
+            TrackRailsWorld rails = getWorld().getRails();
+            rails.clear();
+            for (TrackCoaster coaster : getCoasters()) {
+                for (TrackNode node : coaster.getNodes()) {
+                    rails.store(node);
+                }
+            }
+        }
     }
 
     /**
      * Called every tick to update any changed nodes
      */
+    @Override
     public void updateAll() {
-        if (!this._changedNodes.isEmpty()) {
-            // For two cycles, add the neighbours of the nodes we have already collected
-            // this is because a node change has a ripple effect that extends two connected nodes down
-            this._changedNodesLive.addAll(this._changedNodes);
-            for (int n = 0; n < 2; n++) {
-                int size = this._changedNodesLive.size();
-                for (int i = 0; i < size; i++) {
-                    TrackNode node = this._changedNodesLive.get(i);
-                    for (TrackConnection conn_a : node._connections) {
-                        TrackNode other = conn_a.getOtherNode(node);
-                        if (this._changedNodes.add(other)) {
-                            this._changedNodesLive.add(other);
-                        }
-                    }
-                }
-                this._changedNodesLive.subList(0, size).clear();
-            }
-            this._changedNodesLive.clear();
+        this._changedNodesPriority.clear(); // At this stage this shouldn't even contain elements
+        runAllUpdates(this._changedNodes, true);
+    }
 
+    /**
+     * To be called manually, to update all the (adjacent) nodes scheduled using
+     * {@link #scheduleNodeRefreshWithPriority(TrackNode)}
+     */
+    public void updateAllWithPriority() {
+        this._changedNodes.removeAll(this._changedNodesPriority); // No need for these next tick
+        runAllUpdates(this._changedNodesPriority, true);
+    }
+
+    private void runAllUpdates(NodeUpdateList updates, boolean updateRails) {
+        Set<TrackNode> nodesToUpdate = updates.getAllNodesToUpdate();
+        if (!nodesToUpdate.isEmpty()) {
             // Connections of changedNodes
-            HashSet<TrackConnection> changedConnections = new HashSet<TrackConnection>(this._changedNodes.size()+1);
+            HashSet<TrackConnection> changedConnections = new HashSet<TrackConnection>(nodesToUpdate.size()+1);
 
             // Remove nodes from the changed list that have been removed
             // This avoids executing logic on removed nodes, or worse, adding to the rails world
             // Refresh all the node's shape and track the connections that also changed
-            for (Iterator<TrackNode> iter = this._changedNodes.iterator(); iter.hasNext(); ) {
+            for (Iterator<TrackNode> iter = nodesToUpdate.iterator(); iter.hasNext(); ) {
                 TrackNode changedNode = iter.next();
                 if (changedNode.isRemoved()) {
                     iter.remove();
                     continue;
                 }
 
-                changedNode.onShapeUpdated();
+                try {
+                    changedNode.onShapeUpdated();
+                } catch (Throwable t) {
+                    getPlugin().getLogger().log(Level.SEVERE, "An error occurred updating shape of node " +
+                            changedNode.getPosition(), t);
+                }
+
                 changedConnections.addAll(changedNode.getConnections());
             }
+
             for (TrackConnection changedConnection : changedConnections) {
-                changedConnection.onShapeUpdated();
+                try {
+                    changedConnection.onShapeUpdated();
+                } catch (Throwable t) {
+                    getPlugin().getLogger().log(Level.SEVERE, "An error occurred updating shape of connection [" +
+                            changedConnection.getNodeA().getPosition() + " TO " +
+                            changedConnection.getNodeB().getPosition() + "]", t);
+                }
             }
 
-            // Purge all cached rail information for the changed nodes
-            this.getWorld().getRails().purge(this._changedNodes);
+            if (updateRails) {
+                // Purge all cached rail information for the changed nodes
+                this.getWorld().getRails().purge(nodesToUpdate);
 
-            // Re-create all the cached rail information for the changed nodes
-            for (TrackNode changedNode : this._changedNodes) {
-                this.getWorld().getRails().store(changedNode);
+                // Re-create all the cached rail information for the changed nodes
+                for (TrackNode changedNode : nodesToUpdate) {
+                    this.getWorld().getRails().store(changedNode);
+                }
             }
-            this._changedNodes.clear();
+            updates.clear();
         }
+    }
+
+    /**
+     * Schedules a node for refreshing it's shape and path information in the world right away.
+     * Caller should next call {@link #updateAllWithPriority()}.
+     *
+     * @param node
+     */
+    public void scheduleNodeRefreshWithPriority(TrackNode node) {
+        this._changedNodes.add(node); // Just to make sure this gets handled at all in the future
+        this._changedNodesPriority.add(node);
     }
 
     /**
@@ -666,7 +865,7 @@ public class TrackWorld implements CoasterWorldComponent {
 
                 // Deletes the physical saved files of the coasters
                 String baseName = TCCoasters.escapeName(coaster.getName());
-                File folder = getConfigFolder();
+                File folder = this.getWorld().getConfigFolder(true);
                 File tmpFile = new File(folder, baseName + ".csv.tmp");
                 File realFile = new File(folder, baseName + ".csv");
                 if (tmpFile.exists()) {
@@ -682,11 +881,10 @@ public class TrackWorld implements CoasterWorldComponent {
     }
 
     private static void addConnectionToNode(TrackNode node, TrackConnection connection) {
-        node._connections = Arrays.copyOf(node._connections, node._connections.length + 1);
-        node._connections[node._connections.length - 1] = connection;
+        node._connections = LogicUtil.appendArray(node._connections, connection);
     }
 
-    private static void removeConnectionFromNode(TrackNode node, TrackConnection connection) {
+    private static boolean removeConnectionFromNode(TrackNode node, TrackConnection connection) {
         if (node._connections.length != 1) {
             for (int i = 0; i < node._connections.length; i++) {
                 if (node._connections[i] == connection) {
@@ -694,11 +892,67 @@ public class TrackWorld implements CoasterWorldComponent {
                     System.arraycopy(node._connections, 0, new_connections, 0, i);
                     System.arraycopy(node._connections, i+1, new_connections, i, node._connections.length-i-1);
                     node._connections = new_connections;
-                    break;
+                    return true;
                 }
             }
         } else if (node._connections[0] == connection) {
             node._connections = TrackConnection.EMPTY_ARR;
+            return true;
+        }
+
+        /* Connection not found */
+        return false;
+    }
+
+    private static final class NodeUpdateList {
+        private final Set<TrackNode> changed = new HashSet<>();
+        private final List<TrackNode> buffer = new ArrayList<>();
+
+        public void add(TrackNode node) {
+            changed.add(node);
+        }
+
+        public void remove(TrackNode node) {
+            changed.remove(node);
+        }
+
+        public void removeAll(NodeUpdateList list) {
+            changed.removeAll(list.changed);
+        }
+
+        public void clear() {
+            changed.clear();
+        }
+
+        public Set<TrackNode> getAllNodesToUpdate() {
+            Set<TrackNode> changed = this.changed;
+            if (!changed.isEmpty()) {
+                addTwoDeepNeighbours(changed, buffer);
+            }
+            return changed;
+        }
+
+        private static void addTwoDeepNeighbours(Set<TrackNode> changed, List<TrackNode> buffer) {
+            // For two cycles, add the neighbours of the nodes we have already collected
+            // this is because a node change has a ripple effect that extends two connected nodes down
+            try {
+                buffer.addAll(changed);
+                for (int n = 0; n < 2; n++) {
+                    int size = buffer.size();
+                    for (int i = 0; i < size; i++) {
+                        TrackNode node = buffer.get(i);
+                        for (TrackConnection conn_a : node._connections) {
+                            TrackNode other = conn_a.getOtherNode(node);
+                            if (changed.add(other)) {
+                                buffer.add(other);
+                            }
+                        }
+                    }
+                    buffer.subList(0, size).clear();
+                }
+            } finally {
+                buffer.clear();
+            }
         }
     }
 }

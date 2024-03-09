@@ -31,12 +31,12 @@ import com.bergerkiller.bukkit.common.utils.CommonUtil;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.common.utils.StringUtil;
 import com.bergerkiller.bukkit.common.wrappers.ChatText;
-import com.bergerkiller.bukkit.tc.controller.components.RailPath;
 
 import cloud.commandframework.annotations.Argument;
 import cloud.commandframework.annotations.CommandDescription;
 import cloud.commandframework.annotations.CommandMethod;
 import cloud.commandframework.annotations.Flag;
+import cloud.commandframework.annotations.specifier.Quoted;
 
 @CommandMethod("tccoasters|tcc")
 class EditStateCommands {
@@ -93,36 +93,6 @@ class EditStateCommands {
                     sender.sendMessage(ChatColor.RED + "Failed to delete some of the track nodes!");
                 }
             }
-        }
-    }
-
-    @CommandRequiresTCCPermission
-    @CommandMethod("undo")
-    @CommandDescription("Undoes the last action")
-    public void commandUndo(
-            final PlayerEditState state,
-            final CommandSender sender,
-            final TCCoasters plugin
-    ) {
-        if (state.getHistory().undo()) {
-            sender.sendMessage("Your last change has been undone");
-        } else {
-            sender.sendMessage("No more changes to undo");
-        }
-    }
-
-    @CommandRequiresTCCPermission
-    @CommandMethod("redo")
-    @CommandDescription("Redoes the last action that was undone using undo")
-    public void commandRedo(
-            final PlayerEditState state,
-            final CommandSender sender,
-            final TCCoasters plugin
-    ) {
-        if (state.getHistory().redo()) {
-            sender.sendMessage("Redo of previous undo is successful");
-        } else {
-            sender.sendMessage("No more changes to redo");
         }
     }
 
@@ -208,7 +178,7 @@ class EditStateCommands {
             final TCCoasters plugin
     ) {
         if (!TCCoastersPermissions.LOCK.has(sender)) {
-            sender.sendMessage(ChatColor.RED + "You do not have permission to unlock coasters");
+            sender.sendMessage(ChatColor.RED + "You do not have permission to lock coasters");
         } else {
             for (TrackCoaster coaster : state.getEditedCoasters()) {
                 coaster.setLocked(true);
@@ -261,7 +231,7 @@ class EditStateCommands {
             final PlayerEditState state,
             final CommandSender sender,
             final TCCoasters plugin,
-            final @Argument("new_coaster_name") String newCoasterName
+            final @Quoted @Argument("new_coaster_name") String newCoasterName
     ) {
         List<String> coasterNames = state.getEditedNodes().stream()
                 .map(TrackNode::getCoaster)
@@ -286,8 +256,8 @@ class EditStateCommands {
             final PlayerEditState state,
             final CommandSender sender,
             final TCCoasters plugin,
-            final @Argument("new_coaster_name") String newCoasterName,
-            final @Argument("old_coaster_name") String oldCoasterName
+            final @Quoted @Argument("new_coaster_name") String newCoasterName,
+            final @Quoted @Argument("old_coaster_name") String oldCoasterName
     ) {
         if (oldCoasterName.equalsIgnoreCase(newCoasterName)) {
             sender.sendMessage(ChatColor.RED + "Old and new coaster name is the same!");
@@ -354,7 +324,7 @@ class EditStateCommands {
     public void commandImport(
             final Player player,
             final TCCoasters plugin,
-            final @Argument("url_or_file") String urlOrFile,
+            final @Quoted @Argument("url_or_file") String urlOrFile,
             final @Flag("absolute") boolean absolute
     ) {
         TCCoastersPermissions.IMPORT.handle(player);
@@ -367,9 +337,20 @@ class EditStateCommands {
             PlayerEditState dlEditState = plugin.getEditState(player);
             TrackCoaster coaster = dlEditState.getWorld().getTracks().createNewEmpty(plugin.generateNewCoasterName());
             try {
-                coaster.loadFromStream(download.contentInputStream(), absolute ? null : PlayerOrigin.getForPlayer(player));
+                try {
+                    coaster.loadFromStream(download.contentInputStream(), player,
+                            absolute ? null : PlayerOrigin.getForPlayer(player));
+                } catch (ChangeCancelledException ex) {
+                    player.sendMessage(ChatColor.RED + "Not all coaster track nodes could be imported!");
+
+                    // Skip the 'failed to decode' message, makes no sense
+                    if (coaster.getNodes().isEmpty()) {
+                        coaster.remove();
+                        return;
+                    }
+                }
                 if (coaster.getNodes().isEmpty()) {
-                    player.sendMessage(ChatColor.RED + "Failed to decode any coaster nodes!");
+                    player.sendMessage(ChatColor.RED + "Failed to decode any coaster track nodes!");
                     coaster.remove();
                     return;
                 }
@@ -379,6 +360,16 @@ class EditStateCommands {
                     coaster.remove();
                     return;
                 }
+            }
+
+            // Check power state permissions. Would rather do it during load but whatever...
+            try {
+                for (TrackNode node : coaster.getNodes()) {
+                    node.checkPowerPermissions(player);
+                }
+            } catch (ChangeCancelledException ex) {
+                coaster.remove();
+                return;
             }
 
             // Handle event
@@ -522,23 +513,6 @@ class EditStateCommands {
             sender.sendMessage(ChatColor.YELLOW + "Right-click drag menu control is now " + ChatColor.GREEN + "ENABLED");
         } else {
             sender.sendMessage(ChatColor.YELLOW + "Right-click drag menu control is now " + ChatColor.RED + "DISABLED");
-        }
-    }
-
-    @CommandRequiresTCCPermission
-    @CommandMethod("debug path")
-    @CommandDescription("Logs the path segments of the selected nodes to system log")
-    public void commandDebugPath(
-            final PlayerEditState state,
-            final CommandSender sender,
-            final TCCoasters plugin
-    ) {
-        sender.sendMessage("Logging paths of all selected nodes");
-        for (TrackNode node : state.getEditedNodes()) {
-            plugin.log(Level.INFO, "Path for: " + node.getPosition());
-            for (RailPath.Point point : node.buildPath().getPoints()) {
-                plugin.log(Level.INFO, "  - " + point);
-            }
         }
     }
 }

@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -16,6 +17,11 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 
+import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSign;
+import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSignLookup;
+import com.bergerkiller.bukkit.tc.events.SignBuildEvent;
+import com.bergerkiller.bukkit.tc.events.SignChangeActionEvent;
+import com.bergerkiller.bukkit.tc.rails.RailLookup;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.command.CommandSender;
@@ -28,9 +34,11 @@ import org.bukkit.plugin.java.JavaPlugin;
 import com.bergerkiller.bukkit.coasters.commands.TCCoastersCommands;
 import com.bergerkiller.bukkit.coasters.csv.TrackCSV;
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
-import com.bergerkiller.bukkit.coasters.editor.TCCoastersDisplay;
+import com.bergerkiller.bukkit.coasters.editor.PlayerEditTool;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectTypeLight;
-import com.bergerkiller.bukkit.coasters.signs.SignActionTrackAnimate;
+import com.bergerkiller.bukkit.coasters.signs.actions.SignActionPower;
+import com.bergerkiller.bukkit.coasters.signs.actions.SignActionTrackAnimate;
+import com.bergerkiller.bukkit.coasters.signs.power.NamedPowerChannel;
 import com.bergerkiller.bukkit.coasters.tracks.TrackCoaster;
 import com.bergerkiller.bukkit.coasters.util.QueuedTask;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
@@ -44,10 +52,8 @@ import com.bergerkiller.bukkit.common.collections.FastIdentityHashMap;
 import com.bergerkiller.bukkit.common.config.FileConfiguration;
 import com.bergerkiller.bukkit.common.io.ByteArrayIOStream;
 import com.bergerkiller.bukkit.common.localization.LocalizationEnum;
-import com.bergerkiller.bukkit.common.map.MapDisplay;
 import com.bergerkiller.bukkit.common.map.MapResourcePack;
 import com.bergerkiller.bukkit.common.utils.CommonUtil;
-import com.bergerkiller.bukkit.common.utils.ItemUtil;
 import com.bergerkiller.bukkit.common.wrappers.HumanHand;
 import com.bergerkiller.bukkit.tc.TCConfig;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
@@ -57,15 +63,20 @@ public class TCCoasters extends PluginBase {
     private static final double DEFAULT_SMOOTHNESS = 10000.0;
     private static final boolean DEFAULT_GLOWING_SELECTIONS = true;
     private static final int DEFAULT_PARTICLE_VIEW_RANGE = 64;
-    private static final int DEFAULT_MAXIMUM_PARTICLE_COUNT = 5000;
+    private static final int DEFAULT_MAXIMUM_PARTICLE_COUNT = 3000;
+    private static final boolean DEFAULT_MAXIMUM_PARTICLE_WARNING = false;
     private static final boolean DEFAULT_PLOTSQUARED_ENABLED = false;
     private static final boolean DEFAULT_LIGHTAPI_ENABLED = true;
     private static final boolean DEFAULT_LEASH_GLITCH_FIX = false;
     private Task worldUpdateTask, runQueuedTasksTask, updatePlayerEditStatesTask, autosaveTask;
     private TCCoastersCommands commands;
     private final CoasterRailType coasterRailType = new CoasterRailType(this);
-    private final SignActionTrackAnimate trackAnimateAction = new SignActionTrackAnimate();
+    private final SignActionPower powerSignAction = new SignActionPower(this);
+    private final List<SignAction> registeredSignActions = Arrays.asList(
+            powerSignAction, new SignActionTrackAnimate());
     private final Hastebin hastebin = new Hastebin(this);
+    private final TrackNodeSign.SignBuildHandler signBuildHandler = detectSignBuildHandler();
+    private final TrackNodeSignLookup signLookup = new TrackNodeSignLookup();
     private final TCCoastersListener listener = new TCCoastersListener(this);
     private final TCCoastersInteractionListener interactionListener = new TCCoastersInteractionListener(this);
     private final Map<Player, PlayerEditState> editStates = new HashMap<Player, PlayerEditState>();
@@ -75,10 +86,12 @@ public class TCCoasters extends PluginBase {
     private boolean glowingSelections = DEFAULT_GLOWING_SELECTIONS;
     private int particleViewRange = DEFAULT_PARTICLE_VIEW_RANGE;
     private int maximumParticleCount = DEFAULT_MAXIMUM_PARTICLE_COUNT;
+    private boolean maximumParticleWarning = DEFAULT_MAXIMUM_PARTICLE_WARNING;
     private boolean plotSquaredEnabled = DEFAULT_PLOTSQUARED_ENABLED;
     private boolean lightAPIEnabled = DEFAULT_LIGHTAPI_ENABLED;
     private boolean fixLeashGlitch = DEFAULT_LEASH_GLITCH_FIX;
     private boolean lightAPIFound = false;
+    private boolean isDisabled = false;
     private Listener plotSquaredHandler = null;
     private File importFolder, exportFolder;
 
@@ -90,6 +103,20 @@ public class TCCoasters extends PluginBase {
         }
     }
 
+    public CoasterRailType getRailType() {
+        return this.coasterRailType;
+    }
+
+    /**
+     * Gets the by-node-sign-key sign lookup. All TCC signs are registered here, mapped to
+     * their unique key.
+     *
+     * @return TCC Sign Lookup
+     */
+    public TrackNodeSignLookup getSignLookup() {
+        return signLookup;
+    }
+
     /**
      * Gets all the coaster information stored for a particular World
      * 
@@ -99,9 +126,15 @@ public class TCCoasters extends PluginBase {
     public CoasterWorld getCoasterWorld(World world) {
         CoasterWorldImpl coasterWorld = this.worlds.get(world);
         if (coasterWorld == null) {
+            if (this.isDisabled) {
+                throw new IllegalStateException("TC-Coasters is disabled");
+            }
             coasterWorld = new CoasterWorldImpl(this, world);
             this.worlds.put(world, coasterWorld);
             coasterWorld.load();
+            if (isEnabled()) {
+                coasterWorld.enable();
+            }
         }
         return coasterWorld;
     }
@@ -155,6 +188,9 @@ public class TCCoasters extends PluginBase {
     public synchronized PlayerEditState getEditState(Player player) {
         PlayerEditState state = editStates.get(player);
         if (state == null) {
+            if (isDisabled) {
+                throw new IllegalStateException("TC-Coasters is disabled");
+            }
             state = new PlayerEditState(this, player);
             editStates.put(player, state);
             state.load();
@@ -206,6 +242,61 @@ public class TCCoasters extends PluginBase {
                 return name;
             }
         }
+    }
+
+    /**
+     * Looks up a named power channel on any of the loaded worlds. If the same state is used
+     * in more than one place, the returned power state controls both. If no power states
+     * by this name could be found, returns null.
+     *
+     * @param name Name of the power state
+     * @return Found sign named power channel, or null if not found
+     */
+    public NamedPowerChannel findGlobalPowerState(String name) {
+        // First see if the name starts with a world name prefix of one of the worlds
+        // If so, find a state on that world specifically.
+        CoasterWorld matchedWorld = findCoasterWorldByPrefix(name);
+        if (matchedWorld != null) {
+            NamedPowerChannel state = matchedWorld.getNamedPowerChannels().findIfExists(
+                    name.substring(matchedWorld.getBukkitWorld().getName().length() + 1));
+            if (state != null) {
+                return state;
+            }
+        }
+
+        List<NamedPowerChannel> results = new ArrayList<>();
+        for (CoasterWorld world : this.worlds.values()) {
+            NamedPowerChannel state = world.getNamedPowerChannels().findIfExists(name);
+            if (state != null) {
+                results.add(state);
+            }
+        }
+        return NamedPowerChannel.multiple(results);
+    }
+
+    /**
+     * Looks for a CoasterWorld that is loaded and where the input text starts
+     * with this world's name (case sensitive) followed by a '.'
+     *
+     * @param text Input text
+     * @return Matched CoasterWorld, or <i>null</i> if none match
+     */
+    public CoasterWorld findCoasterWorldByPrefix(String text) {
+        for (CoasterWorld world : this.worlds.values()) {
+            World loadedWorld = world.getBukkitWorld();
+            if (loadedWorld == null) {
+                continue;
+            }
+            String worldName = loadedWorld.getName();
+            if (text.length() > worldName.length()
+                    && text.startsWith(worldName)
+                    && text.charAt(worldName.length()) == '.'
+            ) {
+                return world;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -293,6 +384,16 @@ public class TCCoasters extends PluginBase {
     }
 
     /**
+     * Gets whether a message is sent to the player when (first) exceeding the maximum
+     * particle limit
+     *
+     * @return show maximum particle warning
+     */
+    public boolean isMaximumParticleWarningEnabled() {
+        return maximumParticleWarning;
+    }
+
+    /**
      * Gets the folder where coasters csv files are exported to when using
      * the export command
      *
@@ -300,6 +401,16 @@ public class TCCoasters extends PluginBase {
      */
     public File getExportFolder() {
         return this.exportFolder;
+    }
+
+    /**
+     * Gets the Sign Building handler that is appropriate for the current version of TrainCarts
+     * run on the server. This handler handles build permissions for new signs
+     *
+     * @return Build handler
+     */
+    public TrackNodeSign.SignBuildHandler getSignBuildHandler() {
+        return signBuildHandler;
     }
 
     @Override
@@ -330,6 +441,8 @@ public class TCCoasters extends PluginBase {
         config.addHeader("maximumParticleCount", "When more particles are visible than this, the player sees a warning, and some particles are hidden");
         config.addHeader("maximumParticleCount", "This can be used to prevent a total lag-out of the client when accidentally creating a lot of track");
         this.maximumParticleCount = config.get("maximumParticleCount", DEFAULT_MAXIMUM_PARTICLE_COUNT);
+        config.setHeader("maximumParticleWarning", "\nWhether to send a warning message to the player when the maximum number of particles is exceeded");
+        this.maximumParticleWarning = config.get("maximumParticleWarning", DEFAULT_MAXIMUM_PARTICLE_WARNING);
         config.setHeader("plotSquaredEnabled", "\nWhether track editing permission integration with PlotSquared is enabled");
         config.addHeader("plotSquaredEnabled", "Players will be unable to edit coasters outside of their personal plot");
         config.addHeader("plotSquaredEnabled", "Give players the 'train.coasters.plotsquared.use' permission to use TCC in their plots");
@@ -340,11 +453,20 @@ public class TCCoasters extends PluginBase {
         boolean priority = config.get("priority", false);
         config.save();
 
+        // Might be important if in the future some rogue plugin management plugin re-uses the constructed class or something
+        isDisabled = false;
+
+        // Signs must be made available by their unique key as soon as possible
+        signLookup.register();
+
         // Magic! Done early before trains are initialized that need this rails.
         RailType.register(this.coasterRailType, priority);
 
         // More magic! Done early so signs are activated on spawn.
-        SignAction.register(this.trackAnimateAction);
+        registeredSignActions.forEach(SignAction::register);
+
+        // Loads/activates the tcc-power signs
+        powerSignAction.initPowerMeta();
 
         // Before loading coasters, detect LightAPI
         // We don't know yet it has enabled, but we'll assume that it will.
@@ -378,6 +500,11 @@ public class TCCoasters extends PluginBase {
             this.getCoasterWorld(world);
         }
 
+        // Start firing off any scheduled pulse changes
+        for (CoasterWorldImpl world : new ArrayList<>(worlds.values())) {
+            world.enable();
+        }
+
         // Schedule some background tasks
         this.worldUpdateTask = (new WorldUpdateTask()).start(1, 1);
         this.runQueuedTasksTask = (new RunQueuedTasksTask()).start(1, 1);
@@ -402,25 +529,35 @@ public class TCCoasters extends PluginBase {
 
     @Override
     public void disable() {
-        this.listener.disable();
-        this.interactionListener.disable();
-        Task.stop(this.worldUpdateTask);
-        Task.stop(this.runQueuedTasksTask);
-        Task.stop(this.updatePlayerEditStatesTask);
-        Task.stop(this.autosaveTask);
+        try {
+            this.listener.disable();
+            this.interactionListener.disable();
+            Task.stop(this.worldUpdateTask);
+            Task.stop(this.runQueuedTasksTask);
+            Task.stop(this.updatePlayerEditStatesTask);
+            Task.stop(this.autosaveTask);
 
-        // Log off all players
-        for (Player player : getPlayersWithEditStates()) {
-            this.logoutPlayer(player);
-        }
+            // Log off all players
+            for (Player player : getPlayersWithEditStates()) {
+                this.logoutPlayer(player);
+            }
 
-        // Unregister ourselves
-        SignAction.unregister(this.trackAnimateAction);
-        RailType.unregister(this.coasterRailType);
+            // Unregister ourselves
+            powerSignAction.deinitPowerMeta();
+            registeredSignActions.forEach(SignAction::unregister);
+            RailType.unregister(this.coasterRailType);
+            signLookup.unregister();
 
-        // Clean up when disabling (save dirty coasters + despawn particles)
-        for (World world : Bukkit.getWorlds()) {
-            unloadWorld(world);
+            // Clean up when disabling (save dirty coasters + despawn particles)
+            for (World world : Bukkit.getWorlds()) {
+                unloadWorld(world);
+            }
+        } finally {
+            // At this point everything is disabled
+            // Guarantee nobody will touch TCC again by explicitly CLEARING all worlds
+            isDisabled = true;
+            worlds.clear();
+            editStates.clear();
         }
     }
 
@@ -487,9 +624,9 @@ public class TCCoasters extends PluginBase {
         this.loadLocales(TCCoastersLocalization.class);
     }
 
-    public void buildAll() {
+    public void rebuildAll() {
         for (CoasterWorld coasterWorld : this.getCoasterWorlds()) {
-            coasterWorld.getRails().rebuild();
+            coasterWorld.getTracks().rebuild();
         }
     }
 
@@ -516,20 +653,18 @@ public class TCCoasters extends PluginBase {
         return true;
     }
 
-    public boolean isHoldingEditTool(Player player) {
+    public PlayerEditTool getHeldTool(Player player) {
         if (!hasUsePermission(player)) {
-            return false;
+            return PlayerEditTool.NONE;
         }
 
         ItemStack mainItem = HumanHand.getItemInMainHand(player);
-        if (MapDisplay.getViewedDisplay(player, mainItem) instanceof TCCoastersDisplay) {
-            return true;
-        } else if (!ItemUtil.isEmpty(mainItem)) {
-            return false;
+        for (PlayerEditTool tool : PlayerEditTool.values()) {
+            if (tool.isItem(this, player, mainItem)) {
+                return tool;
+            }
         }
-
-        ItemStack offItem = HumanHand.getItemInOffHand(player);
-        return MapDisplay.getViewedDisplay(player, offItem) instanceof TCCoastersDisplay;
+        return PlayerEditTool.NONE;
     }
 
     public CompletableFuture<Hastebin.DownloadResult> importFileOrURL(final String fileOrURL) {
@@ -578,6 +713,41 @@ public class TCCoasters extends PluginBase {
 
         // Treat as Hastebin URL
         return this.hastebin.download(fileOrURL);
+    }
+
+    private static TrackNodeSign.SignBuildHandler detectSignBuildHandler() {
+        boolean hasSignBuildEvent;
+        try {
+            SignBuildEvent.class.getConstructor(Player.class, RailLookup.TrackedSign.class, boolean.class);
+            hasSignBuildEvent = true;
+        } catch (Throwable t) {
+            hasSignBuildEvent = false;
+        }
+        return hasSignBuildEvent ? createModernSignBuildHandler() : createLegacySignBuildHandler();
+    }
+
+    private static TrackNodeSign.SignBuildHandler createModernSignBuildHandler() {
+        return (player, trackedSign, interactive) -> {
+            SignBuildEvent event = new SignBuildEvent(player, trackedSign, interactive);
+            SignAction.handleBuild(event);
+            return !event.isCancelled();
+        };
+    }
+
+    @SuppressWarnings("deprecation")
+    private static TrackNodeSign.SignBuildHandler createLegacySignBuildHandler() {
+        return (player, trackedSign, interactive) -> {
+            // Non-interactive building with only permission checking didn't exist here
+            // TODO: We do want to fire the loadedChanged() at least maybe? In legacy times
+            //       it already didn't fire this event (bug?) so it's whatever I guess.
+            if (!interactive) {
+                return true;
+            }
+
+            SignChangeActionEvent event = new SignChangeActionEvent(player, trackedSign);
+            SignAction.handleBuild(event);
+            return !event.isCancelled();
+        };
     }
 
     private static class AutosaveTask extends Task {

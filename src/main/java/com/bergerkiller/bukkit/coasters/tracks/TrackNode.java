@@ -7,18 +7,23 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.function.Function;
 
+import com.bergerkiller.bukkit.coasters.TCCoasters;
 import org.bukkit.Location;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.util.Vector;
 
 import com.bergerkiller.bukkit.coasters.TCCoastersUtil;
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditMode;
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
+import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticle;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticleArrow;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticleLitBlock;
+import com.bergerkiller.bukkit.coasters.particles.TrackParticleSignText;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticleState;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticleText;
+import com.bergerkiller.bukkit.coasters.signs.power.NamedPowerChannel;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 import com.bergerkiller.bukkit.common.bases.IntVector3;
@@ -36,12 +41,15 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     private TrackCoaster _coaster;
     private Vector _pos, _up, _up_visual, _dir;
     private IntVector3 _railBlock;
+    // Signs tied to this node
+    private TrackNodeSign[] _signs = TrackNodeSign.EMPTY_ARR;
     // Named target states of this track node, which can be used for animations
     private TrackNodeAnimationState[] _animationStates;
     //private TrackParticleItem _particle;
     private TrackParticleArrow _upParticleArrow;
     private List<TrackParticleText> _junctionParticles;
     private TrackParticleLitBlock _blockParticle;
+    private TrackParticleSignText _signTextParticle;
     // Connections are automatically updated when connecting/disconnecting
     protected TrackConnection[] _connections;
 
@@ -98,6 +106,9 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
                 }
             }
         });
+
+        this._signTextParticle = null;
+        this.setSignsWithoutMarkChanged(LogicUtil.cloneAll(state.signs, TrackNodeSign::clone));
     }
 
     @Override
@@ -126,10 +137,14 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
         this.setPosition(state.position);
         this.setOrientation(state.orientation);
         this.setRailBlock(state.railBlock);
+        this.setSigns(LogicUtil.cloneAll(state.signs, TrackNodeSign::clone));
     }
 
     public void markChanged() {
-        this._coaster.markChanged();
+        TrackCoaster coaster = this._coaster;
+        if (coaster != null) {
+            coaster.markChanged();
+        }
     }
 
     public final void remove() {
@@ -146,12 +161,16 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     }
 
     public void setPosition(Vector position) {
-        if (!this._pos.equals(position)) {
+        Vector curr = this._pos;
+        if (curr.getX() != position.getX() || curr.getY() != position.getY() || curr.getZ() != position.getZ()) {
             this._pos = position.clone();
             //this._particle.setPosition(this._pos);
             this._upParticleArrow.setPosition(this._pos);
             if (this._railBlock == null) {
                 this._blockParticle.setBlock(this.getRailBlock(true));
+            }
+            if (this._signTextParticle != null) {
+                this._signTextParticle.setPosition(this._pos);
             }
             this.scheduleRefresh();
             this.markChanged();
@@ -303,7 +322,8 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
         double up_n = MathUtil.getNormalizationFactor(up);
         if (!Double.isInfinite(up_n)) {
             up = up.clone().multiply(up_n);
-            if (!this._up.equals(up)) {
+            Vector up_curr = this._up;
+            if (up_curr.getX() != up.getX() || up_curr.getY() != up.getY() || up_curr.getZ() != up.getZ()) {
                 this._up = up;
                 this.scheduleRefresh();
                 this.markChanged();
@@ -371,17 +391,17 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
         if (this._connections[1] == connection) {
             this._connections[1] = this._connections[0];
             this._connections[0] = connection;
-            this.scheduleRefresh();
+            this.scheduleRefreshWithPriority();
             this.markChanged();
             return;
         }
 
         // Find the connection in the array and shift it to the start of the array
-        for (int i = 0; i < this._connections.length; i++) {
+        for (int i = 2; i < this._connections.length; i++) {
             if (this._connections[i] == connection) {
                 System.arraycopy(this._connections, 0, this._connections, 1, i);
                 this._connections[0] = connection;
-                this.scheduleRefresh();
+                this.scheduleRefreshWithPriority();
                 this.markChanged();
                 return;
             }
@@ -541,15 +561,58 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
      * @return zero-distance neighbour, null if no such neighbour exists
      */
     public TrackNode getZeroDistanceNeighbour() {
-        List<TrackNode> result = Collections.emptyList();
         for (TrackConnection connection : this._connections) {
             if (connection.isZeroLength()) {
-                if (result.isEmpty()) {
-                    return connection.getOtherNode(this);
-                }
+                return connection.getOtherNode(this);
             }
         }
         return null;
+    }
+
+    /**
+     * Returns a List of unique TrackNodes that occupy the position of this node. If this
+     * node has a {@link #getZeroDistanceNeighbour() zero distance neighbour} it returns
+     * a list containing this node and that neighbour. Otherwise, it returns a singleton
+     * list of just this node.
+     *
+     * @return List of this node, or this node and a zero-distance neighbour
+     * @see #getZeroDistanceNeighbour()
+     */
+    public List<TrackNode> getNodesAtPosition() {
+        TrackNode zero = getZeroDistanceNeighbour();
+        return zero == null ? Collections.singletonList(this) : Arrays.asList(this, zero);
+    }
+
+    /**
+     * Same as {@link #getZeroDistanceNeighbour()} but only returns the zero-distance
+     * neighbour if it has no connections other than with this node. Instead of null
+     * it returns this node if those conditions aren't met.
+     *
+     * @return zero-distance neighbour, or this node if no such neighbour exists or
+     *         the neighbour has connections to nodes other than this node.
+     */
+    public TrackNode selectZeroDistanceOrphan() {
+        for (TrackConnection connection : this._connections) {
+            if (connection.isZeroLength()) {
+                TrackNode zeroDistNeigh = connection.getOtherNode(this);
+                if (zeroDistNeigh._connections.length == 1) {
+                    return zeroDistNeigh;
+                }
+            }
+        }
+        return this;
+    }
+
+    /**
+     * Gets whether this node is a 'zero distance' orphan. This is a node at the same
+     * position as another node, but not connected to anything else. Orphans like that
+     * must be purged.
+     *
+     * @return True if this node is a zero-distance orphan
+     */
+    public boolean isZeroDistanceOrphan() {
+        TrackConnection[] conn = this._connections;
+        return conn.length == 1 && conn[0].isZeroLength();
     }
 
     public final List<RailJunction> getJunctions() {
@@ -643,14 +706,31 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     }
 
     /**
-     * Checks the connections to this node for a connection with another node
+     * Checks the connections of this node for a connection with another node.
+     * Only node position must match.
      * 
      * @param nodeReference The node (reference) of the node to find a connection with
      * @return Track connection found, null if no such connection exists
      */
-    public final TrackConnection findConnectionWith(TrackNodeReference nodeReference) {
+    public final TrackConnection findConnectionWithReference(TrackNodeReference nodeReference) {
         for (TrackConnection connection : this._connections) {
             if (connection.getOtherNode(this).isReference(nodeReference)) {
+                return connection;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Checks the connections of this node for a connection with another node.
+     * Node must match exactly.
+     *
+     * @param node The node of the node to find a connection with
+     * @return Track connection found, null if no such connection exists
+     */
+    public final TrackConnection findConnectionWithNode(TrackNode node) {
+        for (TrackConnection connection : this._connections) {
+            if (connection.getOtherNode(this) == node) {
                 return connection;
             }
         }
@@ -687,14 +767,17 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     }
 
     public boolean removeAnimationState(String name) {
+        final TCCoasters plugin = this.getPlugin();
         for (int i = 0; i < this._animationStates.length; i++) {
-            if (this._animationStates[i].name.equals(name)) {
-                this._animationStates[i].destroyParticles();
+            TrackNodeAnimationState state = this._animationStates[i];
+            if (state.name.equals(name)) {
+                state.destroyParticles();
                 this._animationStates = LogicUtil.removeArrayElement(this._animationStates, i);
                 for (int j = i; j < this._animationStates.length; j++) {
                     this._animationStates[j].updateIndex(j);
                 }
-                this.getPlugin().forAllEditStates(editState -> editState.notifyNodeAnimationRemoved(TrackNode.this, name));
+                handleSignOwnerUpdates(plugin, state.state.signs, TrackNodeSign.EMPTY_ARR, true);
+                plugin.forAllEditStates(editState -> editState.notifyNodeAnimationRemoved(TrackNode.this, name));
                 return true;
             }
         }
@@ -773,56 +856,147 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     /**
      * Adds or updates an animation state. If an animation state by the same name already exists,
      * it is updated to this state. Otherwise it is added.
-     * 
+     *
      * @param state The animation state to update
      */
     public void updateAnimationState(TrackNodeAnimationState state) {
+        updateAnimationState(state, null);
+    }
+
+    /**
+     * Adds or updates an animation state. If an animation state by the same name already exists,
+     * it is updated to this state. Otherwise it is added.
+     * 
+     * @param state The animation state to update
+     * @param filter A filter predicate that any animation state changes are sent to before they are
+     *               applied. Can return false to cancel the operation.
+     */
+    public void updateAnimationState(TrackNodeAnimationState state, UpdateAnimationStatePredicate filter) {
         // Important for saving!
         this.markChanged();
 
         // Overwrite existing
+        final TCCoasters plugin = getPlugin();
         for (int i = 0; i < this._animationStates.length; i++) {
             TrackNodeAnimationState old_state = this._animationStates[i];
             if (old_state == state) {
                 return;
             } else if (old_state.name.equals(state.name)) {
+                if (filter != null && filter.canUpdateState(this, old_state, state)) {
+                    return;
+                }
+
                 old_state.destroyParticles();
                 this._animationStates[i] = state;
                 state.spawnParticles(this, i);
+                handleSignOwnerUpdates(plugin, old_state.state.signs, state.state.signs, true);
                 return;
             }
         }
 
+        // Check before adding
+        if (filter != null && !filter.canUpdateState(this, null, state)) {
+            return;
+        }
+
         // Add new
-        int new_index = this._animationStates.length;
-        this._animationStates = Arrays.copyOf(this._animationStates, new_index+1);
-        this._animationStates[new_index] = state;
-        state.spawnParticles(this, new_index);
+        this._animationStates = LogicUtil.appendArrayElement(this._animationStates, state);
+        state.spawnParticles(this, this._animationStates.length - 1);
+        handleSignOwnerUpdates(plugin, TrackNodeSign.EMPTY_ARR, state.state.signs, true);
 
         // Refresh any player edit states so they become aware of this animation
-        this.getPlugin().forAllEditStates(editState -> editState.notifyNodeAnimationAdded(this, state.name));
+        plugin.forAllEditStates(editState -> editState.notifyNodeAnimationAdded(this, state.name));
     }
 
     /**
      * Updates all the animation states of this track node smartly by making use of a manipulator function to alter them.
      * When name is null, all animation states are updated, otherwise only the one matching the name is.
-     * 
+     *
      * @param name The name of the animation state to update, null to update all of them
      * @param manipulator Manipulator function to alter the original animation states
      */
-    public void updateAnimationStates(String name, Function<TrackNodeAnimationState, TrackNodeAnimationState> manipulator) {
+    public void updateAnimationStates(String name,
+                                      Function<TrackNodeAnimationState, TrackNodeAnimationState> manipulator
+    ) {
+        updateAnimationStates(name, manipulator, null);
+    }
+
+    /**
+     * Updates all the animation states of this track node smartly by making use of a manipulator function to alter them.
+     * When name is null, all animation states are updated, otherwise only the one matching the name is.
+     * A filter can be specified to filter what state changes are allowed through. Permission handling can be done
+     * this way.
+     * 
+     * @param name The name of the animation state to update, null to update all of them
+     * @param manipulator Manipulator function to alter the original animation states
+     * @param filter An animation state change filter predicate. If it returns false, the change is not made.
+     */
+    public void updateAnimationStates(String name,
+                                      Function<TrackNodeAnimationState, TrackNodeAnimationState> manipulator,
+                                      UpdateAnimationStatePredicate filter
+    ) {
+        final TCCoasters plugin = getPlugin();
         for (int i = 0; i < this._animationStates.length; i++) {
             TrackNodeAnimationState old_state = this._animationStates[i];
             if (name == null || name.equals(old_state.name)) {
                 TrackNodeAnimationState new_state = manipulator.apply(old_state);
                 if (new_state != old_state) {
+                    if (filter != null && !filter.canUpdateState(this, old_state, new_state)) {
+                        continue;
+                    }
+
                     old_state.destroyParticles();
                     this._animationStates[i] = new_state;
                     new_state.spawnParticles(this, i);
+                    handleSignOwnerUpdates(plugin, old_state.state.signs, new_state.state.signs, true);
                     this.markChanged();
                 }
             }
         }
+    }
+
+    /**
+     * Adds a sign to an existing node animation state. The filter specifies permission handling to perform
+     * before the node is added, and can be null to ignore all that.
+     *
+     * @param name Animation state name
+     * @param sign Sign state to add
+     * @param filter Filter predicate to run before adding the sign. Pass null to skip.
+     */
+    public void addAnimationStateSign(String name, TrackNodeSign sign, AddSignPredicate filter) {
+        this.updateAnimationStates(name, anim_state -> {
+            if (filter != null) {
+                // Go to verify we can actually add it first. For this the sign must be bound to this sign.
+                TrackNode oldNode = sign.getNode();
+                boolean oldAddedAsAnimation = sign.isAddedAsAnimation();
+                try {
+                    // Must be addedAsAnimation=false otherwise errors occur (=not a sign)
+                    sign.updateOwner(this.getPlugin(), this, false);
+
+                    // Check
+                    if (!filter.canAddSign(this, sign)) {
+                        return anim_state; // Unchanged
+                    }
+                } finally {
+                    // Restore
+                    sign.updateOwner(this.getPlugin(), oldNode, oldAddedAsAnimation);
+                }
+            }
+
+            return anim_state.updateSigns(LogicUtil.appendArrayElement(anim_state.state.signs, sign));
+        });
+    }
+
+    /**
+     * Adds a connection with another node to an animation state, or to all of them if name is null.
+     * If the connection already existed in an animation state, its information such as track objects
+     * are updated.
+     *
+     * @param name The name of the animation state to add the connection to, null to add to all of them
+     * @param connection The connection to add
+     */
+    public void addAnimationStateConnection(String name, TrackConnectionState connection) {
+        addAnimationStateConnection(name, connection, null);
     }
 
     /**
@@ -832,11 +1006,13 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
      * 
      * @param name The name of the animation state to add the connection to, null to add to all of them
      * @param connection The connection to add
+     * @param filter A filter to call before making an animation state change final. If it returns false, the
+     *               state is not updated
      */
-    public void addAnimationStateConnection(String name, TrackConnectionState connection) {
+    public void addAnimationStateConnection(String name, TrackConnectionState connection, UpdateAnimationStatePredicate filter) {
         if (this.hasAnimationStates() && connection.isConnected(this)) {
             final TrackConnectionState referenced_connection = connection.reference(this.getWorld().getTracks());
-            this.updateAnimationStates(name, state -> state.updateConnection(referenced_connection));
+            this.updateAnimationStates(name, state -> state.updateConnection(referenced_connection), filter);
         }
     }
 
@@ -966,7 +1142,13 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     }
 
     protected void onRemoved() {
+        final TCCoasters plugin = getPlugin();
+
         destroyParticles();
+        handleSignOwnerUpdates(plugin, this._signs, TrackNodeSign.EMPTY_ARR, false);
+        for (TrackNodeAnimationState animState : this._animationStates) {
+            handleSignOwnerUpdates(plugin, animState.state.signs, TrackNodeSign.EMPTY_ARR, true);
+        }
         _coaster = null; // mark removed by breaking reference to coaster
     }
 
@@ -979,6 +1161,10 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
         this._junctionParticles = Collections.emptyList();
         for (TrackNodeAnimationState animState : this._animationStates) {
             animState.destroyParticles();
+        }
+        if (this._signTextParticle != null) {
+            this._signTextParticle.remove();
+            this._signTextParticle = null;
         }
     }
 
@@ -1000,7 +1186,7 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
     /**
      * Sets the rail block, where signs are triggered
      * 
-     * @param railsBlock
+     * @param railBlock New rail block
      */
     public void setRailBlock(IntVector3 railBlock) {
         if (!LogicUtil.bothNullOrEqual(this._railBlock, railBlock)) {
@@ -1008,6 +1194,174 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
             this._blockParticle.setBlock(this.getRailBlock(true));
             this.markChanged();
             this.scheduleRefresh();
+        }
+    }
+
+    /**
+     * Gets an array of all the fake signs tied to this track node
+     *
+     * @return signs
+     */
+    public TrackNodeSign[] getSigns() {
+        return this._signs;
+    }
+
+    /**
+     * Sets a new array of fake signs tied to this track node. Properly cleans up
+     * any old state.
+     *
+     * @param new_signs
+     */
+    public void setSigns(TrackNodeSign[] new_signs) {
+        setSignsWithoutMarkChanged(new_signs);
+        markChanged();
+    }
+
+    private void setSignsWithoutMarkChanged(TrackNodeSign[] new_signs) {
+        TrackNodeSign[] prev_signs = this._signs;
+        this._signs = new_signs;
+        handleSignOwnerUpdates(getPlugin(), prev_signs, new_signs, false);
+        updateSignParticle();
+    }
+
+    /**
+     * Adds a single fake sign
+     *
+     * @param sign
+     */
+    public void addSign(TrackNodeSign sign) {
+        addSign(sign, null);
+    }
+
+    /**
+     * Adds a single fake sign
+     *
+     * @param sign
+     * @param filter Optional predicate to check whether adding the sign is allowed.
+     *               Can be null to ignore.
+     */
+    public void addSign(TrackNodeSign sign, AddSignPredicate filter) {
+        // Remember old state to restore if adding is not allowed
+        TrackNodeSign[] oldSigns = this._signs;
+        TrackNode oldNode = sign.getNode();
+        boolean oldAsAnimation = sign.isAddedAsAnimation();
+
+        this._signs = LogicUtil.appendArrayElement(this._signs, sign);
+        sign.updateOwner(this.getPlugin(), this, false);
+
+        if (filter != null && !filter.canAddSign(this, sign)) {
+            this._signs = oldSigns;
+            sign.updateOwner(this.getPlugin(), oldNode, oldAsAnimation);
+            return;
+        }
+
+        updateSignParticle();
+        markChanged();
+    }
+
+    private void handleSignOwnerUpdates(TCCoasters plugin, TrackNodeSign[] prev_signs, TrackNodeSign[] new_signs, boolean isAnimationState) {
+        if (prev_signs.length == 0) {
+            // Adding stuff only
+            for (TrackNodeSign sign : new_signs) {
+                sign.updateOwner(plugin, this, isAnimationState);
+            }
+        } else if (new_signs.length == 0) {
+            // Removing stuff only
+            for (TrackNodeSign sign : prev_signs) {
+                sign.updateOwner(plugin, null, false);
+            }
+        } else {
+            List<TrackNodeSign> prev_signs_list = Arrays.asList(prev_signs);
+            List<TrackNodeSign> new_signs_list = Arrays.asList(new_signs);
+
+            // Add the new signs first. This makes sure named state common to old and
+            // new signs is preserved.
+            for (TrackNodeSign sign : new_signs) {
+                if (!prev_signs_list.contains(sign)) {
+                    sign.updateOwner(plugin, this, isAnimationState);
+                }
+            }
+
+            // Remove signs that no longer exist
+            for (TrackNodeSign sign : prev_signs_list) {
+                if (!new_signs_list.contains(sign)) {
+                    sign.updateOwner(plugin, null, false);
+                }
+            }
+        }
+    }
+
+    void updateSignParticle() {
+        TrackNodeSign[] signs = this._signs;
+        if (signs.length == 0) {
+            if (this._signTextParticle != null) {
+                this._signTextParticle.remove();
+                this._signTextParticle = null;
+            }
+        } else {
+            String[][] lines = new String[signs.length][];
+            for (int s = 0; s < signs.length; s++) {
+                // Remove lines from the end which are all empty (saves space)
+                TrackNodeSign sign = signs[s];
+                String[] sign_lines = sign.getLines();
+                int line_count = sign_lines.length;
+                while (line_count > 0 && sign_lines[line_count-1].isEmpty()) {
+                    line_count--;
+                }
+                if (line_count != sign_lines.length) {
+                    sign_lines = Arrays.copyOf(sign_lines, line_count);
+                }
+
+                // Add redstone power input channels, if any
+                {
+                    NamedPowerChannel[] channels = sign.getInputPowerChannels();
+                    if (channels.length > 0) {
+                        int len = sign_lines.length;
+                        sign_lines = Arrays.copyOf(sign_lines, len + channels.length);
+                        for (int i = 0; i < channels.length; i++) {
+                            sign_lines[len + i] = channels[i].getInputTooltipText();
+                        }
+                    }
+                }
+
+                // Add redstone power output channel, if any
+                {
+                    NamedPowerChannel[] channels = sign.getOutputPowerChannels();
+                    if (channels.length > 0) {
+                        int len = sign_lines.length;
+                        sign_lines = Arrays.copyOf(sign_lines, len + channels.length);
+                        for (int i = 0; i < channels.length; i++) {
+                            sign_lines[len + i] = channels[i].getOutputTooltipText();
+                        }
+                    }
+                }
+
+                lines[s] = sign_lines;
+            }
+            if (this._signTextParticle == null) {
+                this._signTextParticle = this.getWorld().getParticles().addParticleSignText(this.getPosition(), lines);
+            } else {
+                this._signTextParticle.setSignLines(lines);
+            }
+        }
+    }
+
+    /**
+     * If this track node contains signs with output power states, checks that the given
+     * sender has permission to change those power states. Checks node itself and all
+     * animations.
+     *
+     * @param sender
+     * @throws ChangeCancelledException If sender lacks permission
+     */
+    public void checkPowerPermissions(CommandSender sender) throws ChangeCancelledException {
+        for (TrackNodeSign sign : this._signs) {
+            sign.checkPowerPermissions(sender);
+        }
+        for (TrackNodeAnimationState animState : this._animationStates) {
+            for (TrackNodeSign sign : animState.state.signs) {
+                sign.checkPowerPermissions(sender);
+            }
         }
     }
 
@@ -1052,7 +1406,9 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
         if (connection_b != null) {
             // Remove last point from previous half added, as it's the same
             // as the first point of this half
-            if (connection_a != null) {
+            // Do keep the one point of a zero-length connection or it won't reset rotation.
+            // Exception is if both connections are zero-length. In that case we only want one point.
+            if (connection_a != null && (!connection_a.isZeroLength() || connection_b.isZeroLength())) {
                 points.remove(points.size() - 1);
             }
 
@@ -1069,67 +1425,15 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
             return RailPath.EMPTY;
         }
 
-        RailPath.Builder builder = new RailPath.Builder();
-        for (RailPath.Point point : points) {
-            builder.add(point);
-        }
-        return builder.build();
-
-        // Minimalist.
-        /*
-        IntVector3 railsPos = getRailsBlock();
-        RailPath.Builder builder = new RailPath.Builder();
-        if (connection_a != null) {
-            if (connection_a.getNodeA() == this) {
-                builder.add(connection_a.getPathPoint(railsPos, 0.5));
-                builder.add(connection_a.getPathPoint(railsPos, 0.0));
-            } else {
-                builder.add(connection_a.getPathPoint(railsPos, 0.5));
-                builder.add(connection_a.getPathPoint(railsPos, 1.0));
-            }
-        }
-        if (connection_b != null) {
-            builder.add(connection_b.getPathPoint(railsPos, 0.5));
-        }
-        return builder.build();
-        */
-
-        /*
-        //TODO: We can use less or more iterations here based on how much is really needed
-        // This would help performance a lot!
-        RailPath.Builder builder = new RailPath.Builder();
-        if (connection_a != null) {
-            if (connection_a.getNodeA() == this) {
-                for (int n = 499; n >= 0; --n) {
-                    double t = 0.001 * n;
-                    builder.add(connection_a.getPathPoint(railsPos, t));
-                }
-            } else {
-                for (int n = 499; n <= 1000; n++) {
-                    double t = 0.001 * n;
-                    builder.add(connection_a.getPathPoint(railsPos, t));
-                }
-            }
-        }
-        if (connection_b != null) {
-            if (connection_b.getNodeA() == this) {
-                for (int n = 1; n <= 501; n++) {
-                    double t = 0.001 * n;
-                    builder.add(connection_b.getPathPoint(railsPos, t));
-                }
-            } else {
-                for (int n = 1000-1; n >= 490; --n) {
-                    double t = 0.001 * n;
-                    builder.add(connection_b.getPathPoint(railsPos, t));
-                }
-            }
-        }
-        return builder.build();
-        */
+        return RailPath.create(points.toArray(new RailPath.Point[points.size()]));
     }
 
     private void scheduleRefresh() {
         getWorld().getTracks().scheduleNodeRefresh(this);
+    }
+
+    private void scheduleRefreshWithPriority() {
+        getWorld().getTracks().scheduleNodeRefreshWithPriority(this);
     }
 
     // CoasterWorldAccess
@@ -1147,10 +1451,19 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
      * at the position of this node.
      * 
      * @param world The world to look the node up on
+     * @param excludedNode If multiple track nodes exist at a position, makes sure to
+     *                     exclude this node. Ignored if null. If the excluded node
+     *                     is equal to this node, looks for another node at the same
+     *                     position.
      */
     @Override
-    public TrackNode findOnWorld(TrackWorld world) {
-        return (this._coaster != null) ? this : world.findNodeExact(this._pos);
+    public TrackNode findOnWorld(TrackWorld world, TrackNode excludedNode) {
+        return (this._coaster != null && this != excludedNode) ? this : world.findNodeExact(this._pos, excludedNode);
+    }
+
+    @Override
+    public boolean isExistingNode() {
+        return !isRemoved();
     }
 
     @Override
@@ -1167,5 +1480,15 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
             }
         }
         return this;
+    }
+
+    @FunctionalInterface
+    public interface AddSignPredicate {
+        boolean canAddSign(TrackNode node, TrackNodeSign sign);
+    }
+
+    @FunctionalInterface
+    public interface UpdateAnimationStatePredicate {
+        boolean canUpdateState(TrackNode node, TrackNodeAnimationState oldState, TrackNodeAnimationState newState);
     }
 }

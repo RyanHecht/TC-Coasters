@@ -149,7 +149,7 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
      * Removes this connection, disconnecting the two nodes
      */
     public void remove() {
-        this.getNodeA().getWorld().getTracks().disconnect(this.getNodeA(), this.getNodeB());
+        this.getNodeA().getWorld().getTracks().disconnect(this);
     }
 
     /**
@@ -216,7 +216,7 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
 
     /**
      * Adds multiple track objects at once
-     * 
+     *
      * @param objects
      */
     public void addAllObjects(Collection<TrackObject> objects) {
@@ -226,20 +226,53 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
     }
 
     /**
+     * Adds multiple track objects at once
+     * 
+     * @param objects
+     * @param filter Optional permission filter. Does not add the object if this predicate
+     *               returns false.
+     */
+    public void addAllObjects(Collection<TrackObject> objects, AddObjectPredicate filter) {
+        for (TrackObject object : objects) {
+            if (filter.canAddObject(this, object)) {
+                this.addObject(object);
+            }
+        }
+    }
+
+    /**
+     * Adds all the objects stored in a connection state. A clone of the objects is
+     * created to guarantee the immutability of the track connection state.
+     *
+     * @param connectionObjects
+     */
+    public void addAllObjects(TrackConnectionState connectionObjects) {
+        addAllObjects(connectionObjects, (connection, object) -> true);
+    }
+
+    /**
      * Adds all the objects stored in a connection state. A clone of the objects is
      * created to guarantee the immutability of the track connection state.
      * 
      * @param connectionObjects
+     * @param filter Optional permission filter. Does not add the object if this predicate
+     *               returns false.
      */
-    public void addAllObjects(TrackConnectionState connectionObjects) {
+    public void addAllObjects(TrackConnectionState connectionObjects, AddObjectPredicate filter) {
         if (connectionObjects.hasObjects()) {
             if (connectionObjects.isSameFlipped(this)) {
                 for (TrackObject object : connectionObjects.getObjects()) {
-                    this.addObject(object.cloneFlipEnds(this));
+                    TrackObject clone = object.cloneFlipEnds(this);
+                    if (filter.canAddObject(this, clone)) {
+                        this.addObject(clone);
+                    }
                 }
             } else {
                 for (TrackObject object : connectionObjects.getObjects()) {
-                    this.addObject(object.clone());
+                    TrackObject clone = object.clone();
+                    if (filter.canAddObject(this, clone)) {
+                        this.addObject(clone);
+                    }
                 }
             }
         }
@@ -317,6 +350,9 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
         // Reset (is lazy initialized again if needed)
         this.fullDistance = Double.NaN;
 
+        // Ensure orientation of A and B have an aligned forward vector
+        this._endB.alignOrientationForward(this._endA.getOrientation());
+
         // Initialize the 4 points of the De Casteljau's algorithm inputs
         // d1 and d2 are the diff between p1-p3 and p2-p4
 
@@ -354,11 +390,11 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
     /**
      * Calculates all the discrete path points required to build the smooth path from t0 to t1.
      * 
-     * @param builder
-     * @param railsPos
-     * @param smoothness
-     * @param t0
-     * @param t1
+     * @param points Points list to add points of the path to
+     * @param railsPos Rail block
+     * @param smoothness Configured smoothness value
+     * @param t0 Start theta [0 .. 1]
+     * @param t1 End theta [0 .. 1]
      */
     public void buildPath(List<RailPath.Point> points, IntVector3 railsPos, double smoothness, double t0, double t1) {
         // If this is a zero-length connection, only add a point at t1
@@ -540,7 +576,7 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
      * @return orientation at t
      */
     public Vector getOrientation(double t) {
-        return Util.lerpOrientation(this._endA.node.getOrientation(), this._endB.node.getOrientation(), t);
+        return Quaternion.slerp(this._endA.getOrientation(), this._endB.getOrientation(), t).upVector();
     }
 
     /**
@@ -613,6 +649,11 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
         public NodeEndPoint(TrackNode node, TrackNode other) {
             this.node = node;
             this.other = other;
+
+            // Positions of nodes are fairly well known. We need the strength to know whether
+            // this connection is a zero-length one. For that reason, calculate it earlier.
+            // A second calculation is done later during onShapeUpdated()
+            this.computeStrengthUsingPositions();
         }
 
         @Override
@@ -623,6 +664,11 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
         @Override
         public Vector getNodeDirection() {
             return this.node.getDirection();
+        }
+
+        @Override
+        public Vector getNodeUp() {
+            return this.node.getOrientation();
         }
 
         @Override
@@ -681,5 +727,10 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
         public String toString() {
             return "{x=" + position.getX() + ", y=" + position.getY() + ", z=" + position.getZ() + ", distance=" + distance + "}";
         }
+    }
+
+    @FunctionalInterface
+    public interface AddObjectPredicate {
+        boolean canAddObject(TrackConnection connection, TrackObject object);
     }
 }

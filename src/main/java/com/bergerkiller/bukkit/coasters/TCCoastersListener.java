@@ -13,7 +13,9 @@ import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.event.world.WorldInitEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 
+import com.bergerkiller.bukkit.coasters.editor.PlayerEditMode;
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
+import com.bergerkiller.bukkit.coasters.editor.PlayerEditTool;
 import com.bergerkiller.bukkit.coasters.events.CoasterConnectionEvent;
 import com.bergerkiller.bukkit.coasters.events.CoasterNodeEvent;
 import com.bergerkiller.bukkit.coasters.world.CoasterWorld;
@@ -38,25 +40,31 @@ public class TCCoastersListener implements Listener {
         world.getParticles().hideAllFor(event.getPlayer());
     }
 
+    /* Note: Do not ignore cancelled events! Player clicks from afar are cancelled by default. */
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerInteract(PlayerInteractEvent event) {
-        if (!this.plugin.isHoldingEditTool(event.getPlayer())) {
-            return;
-        }
+        final boolean isLeftClick = (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK);
+        final boolean isRightClick = (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK);
+        final PlayerEditTool tool = plugin.getHeldTool(event.getPlayer());
+        if (tool != PlayerEditTool.NONE) {
+            PlayerEditState state = this.plugin.getEditState(event.getPlayer());
+            if (state.getMode() != PlayerEditMode.DISABLED) {
+                // This one is tricky to handle generically
+                if (tool.isNodeSelector() && isRightClick) {
+                    state.setTargetedBlock(event.getClickedBlock(), event.getBlockFace());
+                }
 
-        PlayerEditState state = this.plugin.getEditState(event.getPlayer());
-        if (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK) {
-            event.setCancelled(state.onLeftClick());
-        }
-        if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
-            state.setTargetedBlock(event.getClickedBlock(), event.getBlockFace());
-            event.setCancelled(state.onRightClick());
+                // Handle tool
+                if (tool.handleClick(state, isLeftClick, isRightClick, event.getClickedBlock())) {
+                    event.setCancelled(true);
+                }
+            }
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerSneakChange(PlayerToggleSneakEvent event) {
-        if (!this.plugin.isHoldingEditTool(event.getPlayer())) {
+        if (!this.plugin.getHeldTool(event.getPlayer()).isNodeSelector()) {
             return;
         }
 
