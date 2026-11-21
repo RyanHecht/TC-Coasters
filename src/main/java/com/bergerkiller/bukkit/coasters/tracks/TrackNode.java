@@ -1323,9 +1323,19 @@ public class TrackNode implements TrackNodeReference, CoasterWorldComponent, Loc
             }
 
             // Remove signs that no longer exist
+            // If a sign with the same key and lines is still there (e.g. a clone made when an
+            // animation state is applied), the sign is not really removed, and no destroy event
+            // should be fired. Otherwise things like path finding destinations are lost.
             for (TrackNodeSign sign : prev_signs_list) {
                 if (!new_signs_list.contains(sign)) {
-                    sign.updateBinding(plugin, TrackNodeBinding.NONE);
+                    boolean stillExists = false;
+                    for (TrackNodeSign new_sign : new_signs) {
+                        if (sign.isSameSign(new_sign)) {
+                            stillExists = true;
+                            break;
+                        }
+                    }
+                    sign.updateBinding(plugin, TrackNodeBinding.NONE, !stillExists);
                 }
             }
         }
