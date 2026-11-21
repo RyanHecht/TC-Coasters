@@ -57,6 +57,19 @@ public class TrackNodeSign implements Cloneable {
     }
 
     void updateBinding(TCCoasters plugin, TrackNodeBinding newBinding) {
+        updateBinding(plugin, newBinding, true);
+    }
+
+    /**
+     * Updates the binding of this sign
+     *
+     * @param plugin TCCoasters plugin instance
+     * @param newBinding New binding
+     * @param fireDestroy Whether to fire a sign destroy event when this sign goes from
+     *                    active to inactive. Set to false when the sign is not really
+     *                    destroyed, such as when the coasters are only unloaded.
+     */
+    void updateBinding(TCCoasters plugin, TrackNodeBinding newBinding, boolean fireDestroy) {
         if (!newBinding.isActive()) {
             this.cachedFakeSign = null; // Forces re-validation
             plugin.getSignLookup().remove(this); // Remove from lookup
@@ -90,7 +103,7 @@ public class TrackNodeSign implements Cloneable {
             }
 
             // Fire destroy event when removed
-            if (!newBinding.isActive()) {
+            if (!newBinding.isActive() && fireDestroy) {
                 fireDestroyEvent();
             }
         }
