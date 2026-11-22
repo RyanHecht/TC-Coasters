@@ -3,9 +3,12 @@ package com.bergerkiller.bukkit.coasters;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
+import com.bergerkiller.generated.net.minecraft.world.phys.BlockHitResultHandle;
+import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -26,9 +29,9 @@ import com.bergerkiller.bukkit.tc.controller.components.RailState;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogic;
 import com.bergerkiller.bukkit.tc.rails.logic.RailLogicHorizontal;
 import com.bergerkiller.bukkit.tc.rails.type.RailType;
-import com.bergerkiller.generated.net.minecraft.world.level.WorldHandle;
-import com.bergerkiller.generated.net.minecraft.world.phys.AxisAlignedBBHandle;
-import com.bergerkiller.generated.net.minecraft.world.phys.MovingObjectPositionHandle;
+import com.bergerkiller.generated.net.minecraft.world.level.LevelHandle;
+import com.bergerkiller.generated.net.minecraft.world.phys.AABBHandle;
+import com.bergerkiller.generated.net.minecraft.world.phys.HitResultHandle;
 import com.bergerkiller.mountiplex.reflection.declarations.ClassResolver;
 import com.bergerkiller.mountiplex.reflection.declarations.MethodDeclaration;
 import com.bergerkiller.mountiplex.reflection.util.FastMethod;
@@ -44,6 +47,15 @@ public class TCCoastersUtil {
 
     /** Threshold for Position vector equals() */
     private static final double POSITION_EPSILON = 1e-6;
+
+    public static void checkVectorValid(Vector vector, String name) {
+        if (vector == null) {
+            throw new IllegalArgumentException(name + " vector is null");
+        }
+        if (Double.isNaN(vector.getX()) || Double.isNaN(vector.getY()) || Double.isNaN(vector.getZ())) {
+            throw new IllegalArgumentException(name + " vector contains NaN: " + vector);
+        }
+    }
 
     public static int[] getBlockDeltas(double value) {
         if (value > 1e-10) {
@@ -63,7 +75,7 @@ public class TCCoastersUtil {
         return v.getX() + v.getY() + v.getZ();
     }
 
-    public static void snapToBlock(World world, Vector eyePos, Vector position, Vector orientation) {
+    public static boolean snapToBlock(World world, Vector eyePos, Vector position, Vector orientation) {
         // Direction vector to move into to find a free air block
         double wX = eyePos.getX() - position.getX();
         double wY = eyePos.getY() - position.getY();
@@ -75,15 +87,15 @@ public class TCCoastersUtil {
             wX *= wN; wY *= wN; wZ *= wN;
         }
 
-        double totalDistance = 0.0;
+        double totalSolidDistance = 0.0;
         BlockFace curFace = BlockFace.SELF;
         Block curBlock = world.getBlockAt(position.getBlockX(), position.getBlockY(), position.getBlockZ());
         Vector curPos = new Vector(position.getX() - curBlock.getX(),
                                    position.getY() - curBlock.getY(),
                                    position.getZ() - curBlock.getZ());
-        boolean foundFreeSpace = true;
+        boolean isFullySolid = false; /** All blocks between eye and position are solid blocks */
         while (true) {
-            AxisAlignedBBHandle bounds = BlockUtil.getBoundingBox(curBlock);
+            AABBHandle bounds = BlockUtil.getBoundingBox(curBlock);
             if (bounds == null) {
                 break; // Found nonblocking; stop
             }
@@ -94,8 +106,8 @@ public class TCCoastersUtil {
                 break; // Found nonblocking; stop
             }
 
-            if (totalDistance > 5.0) {
-                foundFreeSpace = false;
+            if (totalSolidDistance > 5.0) {
+                isFullySolid = true;
                 break; // Abort
             }
             
@@ -157,9 +169,9 @@ public class TCCoastersUtil {
             curPos.setY(curPos.getY() - dy);
             curPos.setZ(curPos.getZ() - dz);
             curBlock = curBlock.getRelative(dx, dy, dz);
-            totalDistance += minDist;
+            totalSolidDistance += minDist;
         }
-        if (foundFreeSpace) {
+        if (!isFullySolid) {
             position.setX(curPos.getX() + curBlock.getX());
             position.setY(curPos.getY() + curBlock.getY());
             position.setZ(curPos.getZ() + curBlock.getZ());
@@ -167,6 +179,7 @@ public class TCCoastersUtil {
             orientation.setY(curFace.getModY());
             orientation.setZ(curFace.getModZ());
         }
+        return totalSolidDistance > 0.0;
     }
 
     public static boolean snapToCoasterRails(TrackNode selfNode, Vector position, Vector orientation) {
@@ -306,6 +319,22 @@ public class TCCoastersUtil {
     }
 
     /**
+     * Performs raytracing from the player's field of view, calling the BKCommonLib
+     * rayTrace API with it. Returns the raw server result.
+     *
+     * @param player
+     * @return raytrace results, null if not looking at a block
+     */
+    public static BlockHitResultHandle bkclRayTrace(Player player) {
+        Location loc = player.getEyeLocation();
+        Vector dir = loc.getDirection();
+        Vector start = loc.toVector();
+        Vector end = dir.clone().multiply(5.0).add(start);
+        HitResultHandle hitResult = LevelHandle.fromBukkit(loc.getWorld()).rayTrace(start, end);
+        return hitResult instanceof BlockHitResultHandle ? (BlockHitResultHandle) hitResult : null;
+    }
+
+    /**
      * Performs raytracing from the player's field of view, providing information
      * about the block clicked and where on the block was clicked
      * 
@@ -317,14 +346,14 @@ public class TCCoastersUtil {
         Vector dir = loc.getDirection();
         Vector start = loc.toVector();
         Vector end = dir.clone().multiply(5.0).add(start);
-        MovingObjectPositionHandle mop = WorldHandle.fromBukkit(loc.getWorld()).rayTrace(start, end);
-        if (mop == null) {
+        BlockHitResultHandle block = bkclRayTrace(player);
+        if (block == null) {
             return null;
         }
 
         TargetedBlockInfo info = new TargetedBlockInfo();
-        info.position = mop.getPos();
-        info.face = mop.getDirection();
+        info.position = block.getLocation();
+        info.face = block.getDirection();
         Vector blockCoordPos = info.position.clone().add(dir.clone().multiply(1e-5));
         int x = blockCoordPos.getBlockX();
         int y = blockCoordPos.getBlockY();
@@ -368,5 +397,57 @@ public class TCCoastersUtil {
         return Math.abs(a.getX() - b.getX()) < POSITION_EPSILON &&
                Math.abs(a.getY() - b.getY()) < POSITION_EPSILON &&
                Math.abs(a.getZ() - b.getZ()) < POSITION_EPSILON;
+    }
+
+    /**
+     * Gets whether a Player is still connected to the server, and has joined it.
+     * This will also return True if the player is still connected but on the respawn screen
+     *
+     * @param player Player
+     * @return True if still connected
+     */
+    public static boolean isPlayerConnected(Player player) {
+        //TODO: Use BKCommonLib PlayerInstancePhase API instead
+        return player.isValid() || Bukkit.getPlayer(player.getUniqueId()) == player;
+    }
+
+    /**
+     * Writes the items of an array to a StringBuilder, making use of the append function to encode each item.
+     * Writes it as [item, item, item].
+     *
+     * @param str StringBuilder to write to
+     * @param items Array of items to encode
+     * @param appendFunc Function to encode each item into the StringBuilder
+     * @param <T> Item Type
+     */
+    public static <T> void stringifyArrayItems(StringBuilder str, T[] items, BiConsumer<StringBuilder, T> appendFunc) {
+        stringifyArrayItems(str, Arrays.asList(items), appendFunc);
+    }
+
+    /**
+     * Writes the items of an array to a StringBuilder, making use of the append function to encode each item.
+     * Writes it as [item, item, item].
+     *
+     * @param str StringBuilder to write to
+     * @param items Iterable of items to encode
+     * @param appendFunc Function to encode each item into the StringBuilder
+     * @param <T> Item Type
+     */
+    public static <T> void stringifyArrayItems(StringBuilder str, Iterable<T> items, BiConsumer<StringBuilder, T> appendFunc) {
+        str.append('[');
+        boolean first = true;
+        for (T item : items) {
+            if (first) {
+                first = false;
+            } else {
+                str.append(", ");
+            }
+            if (item == null) {
+                str.append("NULL");
+            } else {
+                appendFunc.accept(str, item);
+            }
+        }
+        str.append(']');
     }
 }

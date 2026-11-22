@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
+import com.bergerkiller.bukkit.coasters.editor.PlayerEditClipboard;
 import org.bukkit.ChatColor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
@@ -32,17 +33,19 @@ import com.bergerkiller.bukkit.common.utils.MathUtil;
 import com.bergerkiller.bukkit.common.utils.StringUtil;
 import com.bergerkiller.bukkit.common.wrappers.ChatText;
 
-import cloud.commandframework.annotations.Argument;
-import cloud.commandframework.annotations.CommandDescription;
-import cloud.commandframework.annotations.CommandMethod;
-import cloud.commandframework.annotations.Flag;
-import cloud.commandframework.annotations.specifier.Quoted;
+import org.incendo.cloud.annotation.specifier.FlagYielding;
+import org.incendo.cloud.annotation.specifier.Greedy;
+import org.incendo.cloud.annotation.specifier.Quoted;
+import org.incendo.cloud.annotations.Argument;
+import org.incendo.cloud.annotations.CommandDescription;
+import org.incendo.cloud.annotations.Command;
+import org.incendo.cloud.annotations.Flag;
 
-@CommandMethod("tccoasters|tcc")
+@Command("tccoasters|tcc")
 class EditStateCommands {
 
     @CommandRequiresTCCPermission
-    @CommandMethod("create")
+    @Command("create")
     @CommandDescription("Creates new track nodes, objects or connects selected nodes together")
     public void commandCreate(
             final PlayerEditState state,
@@ -58,7 +61,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("delete")
+    @Command("delete")
     @CommandDescription("Disconnects selected nodes and deletes unconnected nodes and track objects")
     public void commandDelete(
             final PlayerEditState state,
@@ -82,22 +85,24 @@ class EditStateCommands {
         } else {
             // Tracks
             state.deselectLockedNodes();
-            if (!state.hasEditedNodes()) {
+
+            PlayerEditState.TrackDeletionPlan plan = state.createTrackDeletePlan();
+            if (plan.isEmpty()) {
                 sender.sendMessage("No track nodes selected, nothing has been deleted!");
-            } else {
-                try {
-                    int numDeleted = state.getEditedNodes().size();
-                    state.deleteTrack();
-                    sender.sendMessage("Deleted " + numDeleted + " track nodes!");
-                } catch (ChangeCancelledException e) {
-                    sender.sendMessage(ChatColor.RED + "Failed to delete some of the track nodes!");
-                }
+                return;
+            }
+
+            try {
+                plan.execute(state);
+                plan.sendSuccessMessage(sender);
+            } catch (ChangeCancelledException e) {
+                sender.sendMessage(ChatColor.RED + "Failed to delete some of the track nodes!");
             }
         }
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("deselect")
+    @Command("deselect")
     @CommandDescription("Deselects all nodes currently selected")
     public void commandDeselect(
             final PlayerEditState state,
@@ -113,7 +118,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("copy")
+    @Command("copy")
     @CommandDescription("Copies all currently selected nodes to the clipboard")
     public void commandCopy(
             final PlayerEditState state,
@@ -129,7 +134,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("cut")
+    @Command("cut")
     @CommandDescription("Copies all currently selected nodes to the clipboard and deletes them")
     public void commandCut(
             final PlayerEditState state,
@@ -150,27 +155,29 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("paste")
+    @Command("paste")
     @CommandDescription("Pastes the current contents of the clipboard at the current position")
     public void commandPaste(
             final PlayerEditState state,
-            final CommandSender sender,
-            final TCCoasters plugin
+            final CommandSender sender
     ) {
-        if (state.getClipboard().isFilled()) {
-            try {
-                state.getClipboard().paste();
-                sender.sendMessage(state.getClipboard().getNodeCount() + " track nodes pasted from the clipboard at your position!");
-            } catch (ChangeCancelledException e) {
-                sender.sendMessage(ChatColor.RED + "The track nodes could not be pasted here");
-            }
-        } else {
+        final PlayerEditClipboard clipboard = state.getClipboard();
+
+        if (!clipboard.isFilled()) {
             sender.sendMessage("Clipboard is empty, nothing has been pasted!");
+            return;
+        }
+
+        try {
+            clipboard.paste();
+            sender.sendMessage(state.getClipboard().getNodeCount() + " track nodes pasted from the clipboard at your position!");
+        } catch (ChangeCancelledException e) {
+            sender.sendMessage(ChatColor.RED + "The track nodes could not be pasted here");
         }
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("lock")
+    @Command("lock")
     @CommandDescription("Locks the selected coaster so that nobody can change it anymore, until it is unlocked")
     public void commandLock(
             final PlayerEditState state,
@@ -188,7 +195,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("unlock")
+    @Command("unlock")
     @CommandDescription("Unlocks the selected coaster so that it can be changed again after locking")
     public void commandUnlock(
             final PlayerEditState state,
@@ -206,7 +213,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("rename")
+    @Command("rename")
     @CommandDescription("Shows help about renaming, and what coasters exist")
     public void commandRenameHelp(
             final PlayerEditState state,
@@ -225,7 +232,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("rename <new_coaster_name>")
+    @Command("rename <new_coaster_name>")
     @CommandDescription("Renames the selected coaster to a new name, so that the csv file of it can be identified")
     public void commandRename(
             final PlayerEditState state,
@@ -250,7 +257,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("rename <new_coaster_name> <old_coaster_name>")
+    @Command("rename <new_coaster_name> <old_coaster_name>")
     @CommandDescription("Renames a coaster by an old name to a new name, so that the csv file of it can be identified")
     public void commandRename(
             final PlayerEditState state,
@@ -279,7 +286,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("straight")
+    @Command("straight")
     @CommandDescription("Makes connections between selected nodes straight")
     public void commandStraight(
             final PlayerEditState state,
@@ -299,7 +306,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("curved")
+    @Command("curved")
     @CommandDescription("Makes connections between selected nodes curved")
     public void commandCurved(
             final PlayerEditState state,
@@ -319,12 +326,12 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("import <url_or_file>")
+    @Command("import <url_or_file>")
     @CommandDescription("Imports a coaster by (down)loading a csv file")
     public void commandImport(
             final Player player,
             final TCCoasters plugin,
-            final @Quoted @Argument("url_or_file") String urlOrFile,
+            final @FlagYielding @Greedy @Argument("url_or_file") String urlOrFile,
             final @Flag("absolute") boolean absolute
     ) {
         TCCoastersPermissions.IMPORT.handle(player);
@@ -407,14 +414,15 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("export")
+    @Command("export")
     @CommandDescription("Exports a coaster to a haste bin server or local file")
     public void commandExport(
             final PlayerEditState state,
             final CommandSender sender,
             final TCCoasters plugin,
             final @Flag(value="file", description="Whether to export to a file in the plugin export folder") boolean exportToFile,
-            final @Flag(value="nl2", description="Whether to export in the NoLimits2 fileformat") boolean nolimits2Format
+            final @Flag(value="nl2", description="Whether to export in the NoLimits2 fileformat") boolean nolimits2Format,
+            final @Flag(value="origin", description="Whether to write the NoLimits2 positions relative to the player") boolean nolimits2Origin
     ) {
         TCCoastersPermissions.EXPORT.handle(sender);
         if (!state.hasEditedNodes()) {
@@ -434,7 +442,7 @@ class EditStateCommands {
             try (TrackCSVWriter writer = new TrackCSVWriter(stream, nolimits2Format ? '\t' : ',')) {
                 if (nolimits2Format) {
                     // NoLimits2 format
-                    writer.writeAllNoLimits2(exportedNodes);
+                    writer.writeAllNoLimits2(exportedNodes, nolimits2Origin ? PlayerOrigin.getForPlayer(state.getPlayer()) : null);
                 } else {
                     // Normal TCC format
                     writer.setWriteLinksToForeignNodes(false);
@@ -476,7 +484,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("info")
+    @Command("info")
     @CommandDescription("Shows meta information about the selected nodes")
     public void commandInfo(
             final PlayerEditState state,
@@ -500,7 +508,7 @@ class EditStateCommands {
     }
 
     @CommandRequiresTCCPermission
-    @CommandMethod("option dragcontrol <enabled>")
+    @Command("option dragcontrol <enabled>")
     @CommandDescription("Sets whether position sliders can be controlled by right-click dragging ingame")
     public void commandOptionDragControl(
             final PlayerEditState state,
@@ -514,5 +522,67 @@ class EditStateCommands {
         } else {
             sender.sendMessage(ChatColor.YELLOW + "Right-click drag menu control is now " + ChatColor.RED + "DISABLED");
         }
+    }
+
+    @org.incendo.cloud.annotations.Permission("train.coasters.customviewrange")
+    @Command("option particleviewrange")
+    @CommandDescription("Gets the particle view range set for yourself")
+    public void commandOptionViewRangeGet(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final TCCoasters plugin
+    ) {
+        if (state.isParticleViewRangeOverridden()) {
+            sender.sendMessage(ChatColor.YELLOW + "Particle view range is set to " +
+                    ChatColor.WHITE + state.getParticleViewRange());
+        } else {
+            sender.sendMessage(ChatColor.YELLOW + "Particle view range is set to the default " +
+                    ChatColor.WHITE + state.getParticleViewRange());
+        }
+        ChatText.fromMessage(ChatColor.YELLOW + "Use ")
+                .append(ChatText.fromMessage(ChatColor.WHITE + "/tcc option particleviewrange <value>")
+                        .setClickableSuggestedCommand("/tcc option particleviewrange "))
+                .append(ChatColor.YELLOW + " to change it")
+                .sendTo(sender);
+    }
+
+    @org.incendo.cloud.annotations.Permission("train.coasters.customviewrange")
+    @Command("option particleviewrange <range>")
+    @CommandDescription("Sets the particle view range for yourself")
+    public void commandOptionViewRangeSet(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final TCCoasters plugin,
+            final @Argument("range") int range
+    ) {
+        if (range < 0) {
+            sender.sendMessage(ChatColor.RED + "Particle view range must be greater than or equal to 0");
+            return;
+        }
+
+        int safeRange = range;
+        if (safeRange > plugin.getMaximumParticleViewRange()) {
+            safeRange = plugin.getMaximumParticleViewRange();
+            sender.sendMessage(ChatColor.RED + "Range of " + range + " is too high and has been limited " +
+                    "(maximum: " + plugin.getMaximumParticleViewRange() + ")");
+        }
+        int oldRange = state.getParticleViewRange();
+        state.setParticleViewRangeOverride(safeRange);
+        sender.sendMessage(ChatColor.YELLOW + "Particle view range set to " + ChatColor.WHITE + safeRange +
+                           ChatColor.YELLOW + " (was " + ChatColor.WHITE + oldRange + ChatColor.YELLOW + ")");
+    }
+
+    @org.incendo.cloud.annotations.Permission("train.coasters.customviewrange")
+    @Command("option particleviewrange reset")
+    @CommandDescription("Resets your particle view range to the default")
+    public void commandOptionViewRangeReset(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final TCCoasters plugin
+    ) {
+        int oldRange = state.getParticleViewRange();
+        state.setParticleViewRangeOverride(null);
+        sender.sendMessage(ChatColor.YELLOW + "Particle view range reset to default " + ChatColor.WHITE + plugin.getParticleViewRange() +
+                           ChatColor.YELLOW + " (was " + ChatColor.WHITE + oldRange + ChatColor.YELLOW + ")");
     }
 }

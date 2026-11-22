@@ -4,6 +4,11 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 
+import com.bergerkiller.bukkit.common.Common;
+import com.bergerkiller.bukkit.common.wrappers.HumanHandRole;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundAttackPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundPunchPacketHandle;
+import com.bergerkiller.generated.net.minecraft.world.phys.BlockHitResultHandle;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
@@ -31,12 +36,11 @@ import com.bergerkiller.bukkit.common.utils.PlayerUtil;
 import com.bergerkiller.bukkit.common.utils.WorldUtil;
 import com.bergerkiller.bukkit.common.wrappers.BlockData;
 import com.bergerkiller.bukkit.common.wrappers.HumanHand;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInArmAnimationHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInBlockDigHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInBlockPlaceHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInUseEntityHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInUseItemHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayInBlockDigHandle.EnumPlayerDigTypeHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundSwingPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundPlayerActionPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundUseItemPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundInteractPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ServerboundUseItemOnPacketHandle;
 
 /**
  * This packet listener detects when players click on the invisible entities for virtual rails,
@@ -47,11 +51,14 @@ import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlay
 public class TCCoastersInteractionListener implements PacketListener, Listener {
     private static final long MIN_ARM_SWING_INTERVAL_MS = 100;
     private static final long MIN_BLOCK_BREAK_EFFECT_TIME_MS = 100;
+    private static final boolean BKCL_PUNCH_PACKET_MERGE = Common.hasCapability("Packets:SwingIsNowPunchPacket");
     public static final PacketType[] PACKET_TYPES = {
-            PacketType.IN_USE_ENTITY,
+            PacketType.IN_INTERACT,
+            PacketType.IN_ATTACK,
             PacketType.IN_USE_ITEM,
-            PacketType.IN_BLOCK_PLACE,
-            PacketType.IN_ENTITY_ANIMATION
+            PacketType.IN_USE_ITEM_ON,
+            PacketType.IN_SWING, // Remove once BKCL 2.0.5 is a hard-dep
+            PacketType.IN_PUNCH
     };
 
     private final TCCoasters plugin;
@@ -121,7 +128,14 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
         PlayerEditState state = this.plugin.getEditState(event.getPlayer());
 
         // Limit arm swing animations to a certain amount per time frame
-        if (event.getType() == PacketType.IN_ENTITY_ANIMATION) {
+        boolean isPunchPacket;
+        if (BKCL_PUNCH_PACKET_MERGE) {
+            isPunchPacket = event.getType() == PacketType.IN_PUNCH;
+        } else {
+            // Older BKCL. Can remove all of this when BKCommonLib 2.0.5 or later is a hard-dep.
+            isPunchPacket = event.getType() == PacketType.IN_PUNCH || event.getType() == PacketType.IN_SWING;
+        }
+        if (isPunchPacket) {
             long time_new = System.currentTimeMillis();
             Metadata meta = createMeta(event.getPlayer());
             if (meta.isArmSwingActive(time_new)) {
@@ -135,41 +149,43 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
         // to switch to the other hand, or outright fire a BlockPlace instead. Detect when this happens,
         // and verify placement truly is impossible before letting it slip. Basically, we must correct
         // for the 'this spot is occupied' check on the client side before it happens.
-        if (event.getType() == PacketType.IN_USE_ITEM || event.getType() == PacketType.IN_BLOCK_PLACE) {
+        if (event.getType() == PacketType.IN_USE_ITEM || event.getType() == PacketType.IN_USE_ITEM_ON) {
             // Avoids expensive rayTrace call for no reason
             if (ignoreInteractPacket) {
                 return;
             }
 
             boolean needsCheck = false;
-            TargetedBlockInfo clickInfo = null;
-            HumanHand suggestedHand = HumanHand.LEFT;
-            if (event.getType() == PacketType.IN_BLOCK_PLACE) {
+            BlockHitResultHandle blockHitResult = null;
+            HumanHandRole suggestedHandRole = HumanHandRole.OFF;
+            if (event.getType() == PacketType.IN_USE_ITEM) {
                 // Block place is used when we cannot place with either hand - always check
                 // We don't know the specifics so perform some ray tracing
                 needsCheck = true;
-                clickInfo = TCCoastersUtil.rayTrace(event.getPlayer());
+                blockHitResult = TCCoastersUtil.bkclRayTrace(event.getPlayer());
 
-                suggestedHand = PacketType.IN_BLOCK_PLACE.getHand(event.getPacket(), event.getPlayer());
-                if (!ItemUtil.isEmpty(HumanHand.getHeldItem(event.getPlayer(), suggestedHand))) {
+                ServerboundUseItemPacketHandle packet = ServerboundUseItemPacketHandle.createHandle(event.getPacket().getHandle());
+
+                suggestedHandRole = packet.getHandRole();
+                if (!ItemUtil.isEmpty(suggestedHandRole.getHeldItem(event.getPlayer()))) {
                     return; // Player holds an item, ignore
                 }
 
-                HumanHand otherHand = suggestedHand.opposite();
-                if (!ItemUtil.isEmpty(HumanHand.getHeldItem(event.getPlayer(), otherHand))) {
-                    suggestedHand = otherHand;
+                HumanHandRole otherHandRole = suggestedHandRole.opposite();
+                if (!ItemUtil.isEmpty(otherHandRole.getHeldItem(event.getPlayer()))) {
+                    suggestedHandRole = otherHandRole;
                 }
             } else {
-                PacketPlayInUseItemHandle packet = PacketPlayInUseItemHandle.createHandle(event.getPacket().getHandle());
+                ServerboundUseItemOnPacketHandle packet = ServerboundUseItemOnPacketHandle.createHandle(event.getPacket().getHandle());
 
                 // Use item is used - is the item we interact with null (empty?)
                 // And is the item in the other hand not empty? This is a strong indicator.
-                HumanHand hand = packet.getHand(event.getPlayer());
-                if (ItemUtil.isEmpty(HumanHand.getHeldItem(event.getPlayer(), hand))) {
-                    HumanHand other = hand.opposite();
-                    if (!ItemUtil.isEmpty(HumanHand.getHeldItem(event.getPlayer(), other))) {
+                HumanHandRole handRole = packet.getHandRole();
+                if (ItemUtil.isEmpty(handRole.getHeldItem(event.getPlayer()))) {
+                    HumanHandRole otherRole = handRole.opposite();
+                    if (!ItemUtil.isEmpty(otherRole.getHeldItem(event.getPlayer()))) {
                         needsCheck = true;
-                        suggestedHand = other;
+                        suggestedHandRole = otherRole;
                     }
                 }
 
@@ -177,18 +193,15 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
                 if (needsCheck) {
                     // Before we do anything, validate the data in the Use Item packet
                     // Hacked clients might send ridiculous block position coordinates, which could break the server
-                    IntVector3 pos = packet.getPosition();
+                    IntVector3 blockPos = packet.getBlockPos();
                     Vector playerPosDiff = event.getPlayer().getEyeLocation().toVector();
-                    playerPosDiff.setX(playerPosDiff.getX() - pos.x);
-                    playerPosDiff.setY(playerPosDiff.getY() - pos.y);
-                    playerPosDiff.setZ(playerPosDiff.getZ() - pos.z);
+                    playerPosDiff.setX(playerPosDiff.getX() - blockPos.x);
+                    playerPosDiff.setY(playerPosDiff.getY() - blockPos.y);
+                    playerPosDiff.setZ(playerPosDiff.getZ() - blockPos.z);
                     if (playerPosDiff.lengthSquared() > (10.0*10.0)) {
                         needsCheck = false;
                     } else {
-                        clickInfo = new TargetedBlockInfo();
-                        clickInfo.block = event.getPlayer().getWorld().getBlockAt(pos.x, pos.y, pos.z);
-                        clickInfo.face = packet.getDirection();
-                        clickInfo.position = new Vector(packet.getDeltaX(), packet.getDeltaY(), packet.getDeltaZ());
+                        blockHitResult = packet.getHitResult();
                     }
                 }
             }
@@ -203,24 +216,43 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
             }
 
             // Fix it
-            if (event.getType() == PacketType.IN_BLOCK_PLACE) {
-                if (clickInfo == null) {
+            if (event.getType() == PacketType.IN_USE_ITEM) {
+                if (blockHitResult == null) {
                     // Switch hand as needed
-                    PacketType.IN_BLOCK_PLACE.setHand(event.getPacket(), event.getPlayer(), suggestedHand);
+                    ServerboundUseItemPacketHandle packet = ServerboundUseItemPacketHandle.createHandle(event.getPacket().getHandle());
+                    event.setPacket(packet.withHandRole(suggestedHandRole));
                 } else {
                     // Cancel old event and fire item placement instead
                     event.setCancelled(true);
-                    fakeItemPlacement(event.getPlayer(), clickInfo, suggestedHand);
+                    fakeItemPlacement(event.getPlayer(), blockHitResult, suggestedHandRole);
                 }
             } else {
                 // Attempt using the other hand instead that has an item
-                PacketPlayInUseItemHandle packet = PacketPlayInUseItemHandle.createHandle(event.getPacket().getHandle());
-                packet.setHand(event.getPlayer(), suggestedHand);
+                ServerboundUseItemOnPacketHandle packet = ServerboundUseItemOnPacketHandle.createHandle(event.getPacket().getHandle());
+                event.setPacket(packet.withHandRole(suggestedHandRole));
             }
         }
 
-        if (event.getType() == PacketType.IN_USE_ENTITY) {
-            PacketPlayInUseEntityHandle packet = PacketPlayInUseEntityHandle.createHandle(event.getPacket().getHandle());
+        if (event.getType() == PacketType.IN_ATTACK) {
+            ServerboundAttackPacketHandle packet = ServerboundAttackPacketHandle.createHandle(event.getPacket().getHandle());
+
+            int entityId = packet.getEntityId();
+            if (!state.getWorld().getParticles().isParticle(event.getPlayer(), entityId)) {
+                return; // Not one of our own entities
+            }
+
+            // This is ours, cancel it.
+            event.setCancelled(true);
+
+            // Find the block interacted with
+            // When the player is in edit mode, skip this expensive lookup and always fire an interaction with block air
+            // Due to a bug we can only do this for 'right click' (interact) actions
+            TargetedBlockInfo clickInfo = TCCoastersUtil.rayTrace(event.getPlayer());
+
+            // Fake the interaction with the blocks
+            fakeBlockDestroy(event.getPlayer(), clickInfo, HumanHand.getMainHand(event.getPlayer()));
+        } else if (event.getType() == PacketType.IN_INTERACT) {
+            ServerboundInteractPacketHandle packet = ServerboundInteractPacketHandle.createHandle(event.getPacket().getHandle());
 
             int entityId = packet.getUsedEntityId();
             if (!state.getWorld().getParticles().isParticle(event.getPlayer(), entityId)) {
@@ -230,26 +262,18 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
             // This is ours, cancel it.
             event.setCancelled(true);
 
-            // Hand (handle, raw)
-            HumanHand hand = packet.getInteractHand(event.getPlayer());
-
-            // Turn the event into a block interaction event
-            boolean isInteractEvent = packet.isInteract() || packet.isInteractAt();
+            // Make sure interaction is done as the same hand role
+            final HumanHandRole handRole = packet.getHandRole();
 
             // Find the block interacted with
             // When the player is in edit mode, skip this expensive lookup and always fire an interaction with block air
             // Due to a bug we can only do this for 'right click' (interact) actions
-            TargetedBlockInfo clickInfo = null;
-            if (!this.plugin.getHeldTool(event.getPlayer()).isNodeSelector() || !isInteractEvent) {
-                clickInfo = TCCoastersUtil.rayTrace(event.getPlayer());
+            BlockHitResultHandle blockHitResult = null;
+            if (!this.plugin.getHeldTool(event.getPlayer()).isNodeSelector()) {
+                blockHitResult = TCCoastersUtil.bkclRayTrace(event.getPlayer());
             }
 
-            // Fake the interaction with the blocks
-            if (isInteractEvent) {
-                fakeItemPlacement(event.getPlayer(), clickInfo, hand);
-            } else {
-                fakeBlockDestroy(event.getPlayer(), clickInfo, hand);
-            }
+            fakeItemPlacement(event.getPlayer(), blockHitResult, handRole);
         }
     }
 
@@ -266,30 +290,31 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
         return meta;
     }
 
-    private void fakeItemPlacement(Player player, TargetedBlockInfo clickInfo, HumanHand hand) {
+    private void fakeItemPlacement(Player player, BlockHitResultHandle blockHitResult, HumanHandRole handRole) {
         boolean ignoreInteractPacket_old = this.ignoreInteractPacket;
         try {
-            if (clickInfo == null) {
+            if (blockHitResult == null) {
                 this.ignoreInteractPacket = true;
 
                 // Block Place is used when not clicking on any block
-                PacketPlayInBlockPlaceHandle packet = PacketPlayInBlockPlaceHandle.T.newHandleNull();
-                packet.setTimestamp(System.currentTimeMillis());
-                packet.setHand(player, fixHand(player, hand));
-                PacketUtil.receivePacket(player, packet);
+                Location eye = player.getEyeLocation();
+                PacketUtil.receivePacket(player, ServerboundUseItemPacketHandle.createNew(
+                        fixHandRole(player, handRole),
+                        System.currentTimeMillis(),
+                        0, /* Sequence */
+                        eye.getYaw(),
+                        eye.getPitch()
+                ));
             } else {
                 createMeta(player).blockPlaceTime = Long.valueOf(System.currentTimeMillis());
 
                 // Send the actual packet
-                PacketPlayInUseItemHandle packet = PacketPlayInUseItemHandle.T.newHandleNull();
-                packet.setTimestamp(System.currentTimeMillis());
-                packet.setHand(player, hand);
-                packet.setDirection(clickInfo.face);
-                packet.setPosition(new IntVector3(clickInfo.block));
-                packet.setDeltaX((float) clickInfo.position.getX());
-                packet.setDeltaY((float) clickInfo.position.getY());
-                packet.setDeltaZ((float) clickInfo.position.getZ());
-                PacketUtil.receivePacket(player, packet);
+                PacketUtil.receivePacket(player, ServerboundUseItemOnPacketHandle.createNew(
+                        handRole,
+                        blockHitResult,
+                        0, /* Sequence */
+                        System.currentTimeMillis() /* Timestamp */
+                ));
             }
         } finally {
             this.ignoreInteractPacket = ignoreInteractPacket_old;
@@ -298,32 +323,39 @@ public class TCCoastersInteractionListener implements PacketListener, Listener {
 
     private void fakeBlockDestroy(Player player, TargetedBlockInfo clickInfo, HumanHand hand) {
         if (clickInfo == null) {
-            // Player arm animation is used to left-click the air
-            PacketPlayInArmAnimationHandle packet = PacketPlayInArmAnimationHandle.T.newHandleNull();
-            packet.setHand(player, hand);
-            PacketUtil.receivePacket(player, packet);
+            if (BKCL_PUNCH_PACKET_MERGE || ServerboundPunchPacketHandle.T.isAvailable()) {
+                // Player punch is used to left-click the air (26.3+), < 26.3 on BKCL 2.0.5 and later
+                ServerboundPunchPacketHandle packet = ServerboundPunchPacketHandle.T.newHandleNull();
+                PacketUtil.receivePacket(player, packet);
+            } else {
+                // Old legacy code. Remove once BKCommonLib 2.0.5 is a hard-dependency
+                // Player arm animation is used to left-click the air
+                ServerboundSwingPacketHandle packet = ServerboundSwingPacketHandle.T.newHandleNull();
+                packet.setHand(player, hand);
+                PacketUtil.receivePacket(player, packet);
+            }
         } else {
             createMeta(player).blockBreakTime = Long.valueOf(System.currentTimeMillis());
 
             // Block dig is used for left-click interaction
-            PacketPlayInBlockDigHandle packet = PacketPlayInBlockDigHandle.T.newHandleNull();
+            ServerboundPlayerActionPacketHandle packet = ServerboundPlayerActionPacketHandle.T.newHandleNull();
             packet.setDirection(clickInfo.face);
             packet.setPosition(new IntVector3(clickInfo.block));
-            packet.setDigType(EnumPlayerDigTypeHandle.START_DESTROY_BLOCK);
+            packet.setDigType(ServerboundPlayerActionPacketHandle.ActionHandle.START_DESTROY_BLOCK);
             PacketUtil.receivePacket(player, packet);
         }
     }
 
-    private static HumanHand fixHand(Player player, HumanHand hand) {
+    private static HumanHandRole fixHandRole(Player player, HumanHandRole handRole) {
         // Right-click air is broken when using a hand that is not holding an item
         // Work around this issue first
-        if (ItemUtil.isEmpty(HumanHand.getHeldItem(player, hand))) {
-            HumanHand otherHand = hand.opposite();
-            if (!ItemUtil.isEmpty(HumanHand.getHeldItem(player, otherHand))) {
-                return otherHand;
+        if (ItemUtil.isEmpty(handRole.getHeldItem(player))) {
+            HumanHandRole otherHandRole = handRole.opposite();
+            if (!ItemUtil.isEmpty(otherHandRole.getHeldItem(player))) {
+                return otherHandRole;
             }
         }
-        return hand;
+        return handRole;
     }
 
     private static class Metadata {

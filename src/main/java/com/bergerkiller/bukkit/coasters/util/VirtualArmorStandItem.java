@@ -2,6 +2,7 @@ package com.bergerkiller.bukkit.coasters.util;
 
 import java.util.UUID;
 
+import com.bergerkiller.bukkit.common.protocol.PlayerGameInfo;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.EquipmentSlot;
@@ -15,18 +16,18 @@ import com.bergerkiller.bukkit.common.utils.EntityUtil;
 import com.bergerkiller.bukkit.common.utils.PacketUtil;
 import com.bergerkiller.bukkit.common.wrappers.DataWatcher;
 import com.bergerkiller.bukkit.tc.Util;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutAttachEntityHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityDestroyHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityEquipmentHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityMetadataHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityTeleportHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutMountHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutSpawnEntityLivingHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEntityLinkPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEquipmentPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEntityDataPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetPassengersPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundAddMobPacketHandle;
 import com.bergerkiller.generated.net.minecraft.world.entity.EntityHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.EntityInsentientHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.EntityLivingHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.ambient.EntityBatHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.decoration.EntityArmorStandHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.MobHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.LivingEntityHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.ambient.BatHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.decoration.ArmorStandHandle;
 
 /**
  * Helper class for spawning and updating a virtual armor stand head item.
@@ -35,8 +36,6 @@ import com.bergerkiller.generated.net.minecraft.world.entity.decoration.EntityAr
  */
 public class VirtualArmorStandItem {
     private static final double ARMORSTAND_HEAD_OFFSET = 1.44;
-    private static final double BAT_HOLDER_OFFSET_GLOWING = ARMORSTAND_HEAD_OFFSET + 0.675;
-    private static final double BAT_HOLDER_OFFSET = BAT_HOLDER_OFFSET_GLOWING + 0.1;
     private static final boolean CAN_GLOW = Common.evaluateMCVersion(">=", "1.9");
     private static final boolean CAN_FIRE_LIT = Common.evaluateMCVersion(">", "1.8");
     private int holderEntityId;
@@ -94,7 +93,7 @@ public class VirtualArmorStandItem {
 
     public VirtualArmorStandItem updateMetadata(Player viewer) {
         if (this.holderEntityId != -1) {
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewSingle(this.holderEntityId));
+            PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewSingle(this.holderEntityId));
         }
         if (this.entityId != -1 && CAN_GLOW) {
             DataWatcher metadata = new DataWatcher();
@@ -102,13 +101,16 @@ public class VirtualArmorStandItem {
             metadata.setFlag(EntityHandle.DATA_FLAGS, EntityHandle.DATA_FLAG_GLOWING, this.glowing);
 
             if (this.glowing) {
-                metadata.setByte(EntityArmorStandHandle.DATA_ARMORSTAND_FLAGS, EntityArmorStandHandle.DATA_FLAG_SET_MARKER);
+                // We set the armorstand on fire so that it emits natural light
+                // To avoid the fire itself showing, set the armorstand to marker mode
+                metadata.setByte(ArmorStandHandle.DATA_ARMORSTAND_FLAGS, ArmorStandHandle.DATA_FLAG_SET_MARKER);
                 metadata.setFlag(EntityHandle.DATA_FLAGS, EntityHandle.DATA_FLAG_ON_FIRE, CAN_FIRE_LIT);
             } else {
-                metadata.setByte(EntityArmorStandHandle.DATA_ARMORSTAND_FLAGS, 0);
+                // Normal display mode. No marker, we don't want models to clip.
+                metadata.setByte(ArmorStandHandle.DATA_ARMORSTAND_FLAGS, 0);
             }
 
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityMetadataHandle.createNew(this.entityId, metadata, true));
+            PacketUtil.sendPacket(viewer, ClientboundSetEntityDataPacketHandle.createNew(this.entityId, metadata, true));
         }
         if (this.holderEntityId != -1) {
             this.spawnHolder(viewer);
@@ -118,7 +120,7 @@ public class VirtualArmorStandItem {
 
     public VirtualArmorStandItem updateItem(Iterable<Player> viewers) {
         if (this.entityId != -1) {
-            PacketPlayOutEntityEquipmentHandle packet = PacketPlayOutEntityEquipmentHandle.createNew(this.entityId, EquipmentSlot.HEAD, this.item);
+            ClientboundSetEquipmentPacketHandle packet = ClientboundSetEquipmentPacketHandle.createNew(this.entityId, EquipmentSlot.HEAD, this.item);
             for (Player viewer : viewers) {
                 PacketUtil.sendPacket(viewer, packet);
             }
@@ -129,8 +131,8 @@ public class VirtualArmorStandItem {
     public VirtualArmorStandItem updateOrientation(Iterable<Player> viewers) {
         if (this.entityId != -1) {
             DataWatcher meta = new DataWatcher();
-            meta.set(EntityArmorStandHandle.DATA_POSE_HEAD, Util.getArmorStandPose(orientation));
-            PacketPlayOutEntityMetadataHandle packet = PacketPlayOutEntityMetadataHandle.createNew(this.entityId, meta, true);
+            meta.set(ArmorStandHandle.DATA_POSE_HEAD, Util.getArmorStandPose(orientation));
+            ClientboundSetEntityDataPacketHandle packet = ClientboundSetEntityDataPacketHandle.createNew(this.entityId, meta, true);
             for (Player viewer : viewers) {
                 PacketUtil.sendPacket(viewer, packet);
             }
@@ -138,10 +140,19 @@ public class VirtualArmorStandItem {
         return this;
     }
 
+    private double getHolderYOffset(Player viewer) {
+        PlayerGameInfo viewerGameInfo = PlayerGameInfo.of(viewer);
+        if (viewerGameInfo.evaluateVersion(">=", "1.20.2")) {
+            return 0.9;
+        } else {
+            return (this.glowing ? 0.675 : 0.775);
+        }
+    }
+
     public VirtualArmorStandItem updatePosition(Player viewer) {
         if (this.holderEntityId == -1) {
             // Teleport the armorstand itself
-            PacketPlayOutEntityTeleportHandle tpPacket = PacketPlayOutEntityTeleportHandle.createNew(
+            ClientboundEntityPositionSyncPacketHandle tpPacket = ClientboundEntityPositionSyncPacketHandle.createNew(
                     this.entityId,
                     this.posX,
                     this.posY - ARMORSTAND_HEAD_OFFSET,
@@ -150,10 +161,10 @@ public class VirtualArmorStandItem {
             PacketUtil.sendPacket(viewer, tpPacket);
         } else {
             // Teleport the armorstand holder
-            PacketPlayOutEntityTeleportHandle tpPacket = PacketPlayOutEntityTeleportHandle.createNew(
+            ClientboundEntityPositionSyncPacketHandle tpPacket = ClientboundEntityPositionSyncPacketHandle.createNew(
                     this.holderEntityId,
                     this.posX,
-                    this.posY - (this.glowing ? BAT_HOLDER_OFFSET_GLOWING : BAT_HOLDER_OFFSET),
+                    this.posY - ARMORSTAND_HEAD_OFFSET - getHolderYOffset(viewer),
                     this.posZ,
                     0.0f, 0.0f, false);
             PacketUtil.sendPacket(viewer, tpPacket);
@@ -163,17 +174,17 @@ public class VirtualArmorStandItem {
 
     public VirtualArmorStandItem destroy(Player viewer) {
         if (this.holderEntityId != -1) {
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewSingle(this.holderEntityId));
+            PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewSingle(this.holderEntityId));
         }
         if (this.entityId != -1) {
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewSingle(this.entityId));
+            PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewSingle(this.entityId));
         }
         return this;
     }
 
     public VirtualArmorStandItem destroyHolderKeepEntityId(Iterable<Player> viewers) {
         if (this.holderEntityId != -1) {
-            PacketPlayOutEntityDestroyHandle packet = PacketPlayOutEntityDestroyHandle.createNewSingle(this.holderEntityId);
+            ClientboundRemoveEntitiesPacketHandle packet = ClientboundRemoveEntitiesPacketHandle.createNewSingle(this.holderEntityId);
             for (Player viewer : viewers) {
                 PacketUtil.sendPacket(viewer, packet);
             }
@@ -193,16 +204,16 @@ public class VirtualArmorStandItem {
         }
 
         DataWatcher metadata = new DataWatcher();
-        metadata.set(EntityArmorStandHandle.DATA_POSE_HEAD, Util.getArmorStandPose(orientation));
+        metadata.set(ArmorStandHandle.DATA_POSE_HEAD, Util.getArmorStandPose(orientation));
         metadata.set(EntityHandle.DATA_FLAGS, (byte) EntityHandle.DATA_FLAG_INVISIBLE);
 
         if (this.glowing && CAN_GLOW) {
             metadata.setFlag(EntityHandle.DATA_FLAGS, EntityHandle.DATA_FLAG_GLOWING, true);
-            metadata.setByte(EntityArmorStandHandle.DATA_ARMORSTAND_FLAGS, EntityArmorStandHandle.DATA_FLAG_SET_MARKER);
+            metadata.setByte(ArmorStandHandle.DATA_ARMORSTAND_FLAGS, ArmorStandHandle.DATA_FLAG_SET_MARKER);
             metadata.setFlag(EntityHandle.DATA_FLAGS, EntityHandle.DATA_FLAG_ON_FIRE, CAN_FIRE_LIT);
         }
 
-        PacketPlayOutSpawnEntityLivingHandle spawnPacket = PacketPlayOutSpawnEntityLivingHandle.createNew();
+        ClientboundAddMobPacketHandle spawnPacket = ClientboundAddMobPacketHandle.createNew();
         spawnPacket.setEntityId(this.entityId);
         spawnPacket.setEntityUUID(UUID.randomUUID());
         spawnPacket.setEntityType(EntityType.ARMOR_STAND);
@@ -214,7 +225,7 @@ public class VirtualArmorStandItem {
         spawnPacket.setHeadYaw(0.0f);
         PacketUtil.sendEntityLivingSpawnPacket(viewer, spawnPacket, metadata);
 
-        PacketUtil.sendPacket(viewer, PacketPlayOutEntityEquipmentHandle.createNew(this.entityId, EquipmentSlot.HEAD, this.item));
+        PacketUtil.sendPacket(viewer, ClientboundSetEquipmentPacketHandle.createNew(this.entityId, EquipmentSlot.HEAD, this.item));
 
         // Put in a mount when we've allocated a holder entity ID
         // Not doing so can cause the object to not move when viewers respawn
@@ -233,25 +244,25 @@ public class VirtualArmorStandItem {
         // Spawn an invisible bat and attach it to that
         // Also used on newer mc versions when smooth movement is required
         // Smooth movement is desirable when animations are going to be played
-        PacketPlayOutSpawnEntityLivingHandle holderPacket = PacketPlayOutSpawnEntityLivingHandle.createNew();
+        ClientboundAddMobPacketHandle holderPacket = ClientboundAddMobPacketHandle.createNew();
         DataWatcher holder_meta = new DataWatcher();
         holderPacket.setEntityId(this.holderEntityId);
         holderPacket.setEntityUUID(UUID.randomUUID());
         holderPacket.setPosX(this.posX);
-        holderPacket.setPosY(this.posY - (this.glowing ? BAT_HOLDER_OFFSET_GLOWING : BAT_HOLDER_OFFSET));
+        holderPacket.setPosY(this.posY - ARMORSTAND_HEAD_OFFSET - getHolderYOffset(viewer));
         holderPacket.setPosZ(this.posZ);
         holderPacket.setEntityType(EntityType.BAT);
         holder_meta.set(EntityHandle.DATA_FLAGS, (byte) (EntityHandle.DATA_FLAG_INVISIBLE | EntityHandle.DATA_FLAG_FLYING));
         holder_meta.set(EntityHandle.DATA_SILENT, true);
-        holder_meta.set(EntityInsentientHandle.DATA_INSENTIENT_FLAGS, (byte) EntityInsentientHandle.DATA_INSENTIENT_FLAG_NOAI);
-        holder_meta.set(EntityLivingHandle.DATA_NO_GRAVITY, true);
-        holder_meta.set(EntityBatHandle.DATA_BAT_FLAGS, (byte) 0);
+        holder_meta.set(MobHandle.DATA_INSENTIENT_FLAGS, (byte) MobHandle.DATA_INSENTIENT_FLAG_NOAI);
+        holder_meta.set(LivingEntityHandle.DATA_NO_GRAVITY, true);
+        holder_meta.set(BatHandle.DATA_BAT_FLAGS, (byte) 0);
         PacketUtil.sendEntityLivingSpawnPacket(viewer, holderPacket, holder_meta);
 
-        if (PacketPlayOutMountHandle.T.isAvailable()) {
-            PacketUtil.sendPacket(viewer, PacketPlayOutMountHandle.createNew(this.holderEntityId, new int[] {this.entityId}));
+        if (ClientboundSetPassengersPacketHandle.T.isAvailable()) {
+            PacketUtil.sendPacket(viewer, ClientboundSetPassengersPacketHandle.createNew(this.holderEntityId, new int[] {this.entityId}));
         } else {
-            PacketUtil.sendPacket(viewer, PacketPlayOutAttachEntityHandle.createNewMount(this.entityId, this.holderEntityId));
+            PacketUtil.sendPacket(viewer, ClientboundSetEntityLinkPacketHandle.createNewMount(this.entityId, this.holderEntityId));
         }
 
         return this;

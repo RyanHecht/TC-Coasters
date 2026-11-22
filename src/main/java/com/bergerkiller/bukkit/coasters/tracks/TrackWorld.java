@@ -2,13 +2,22 @@ package com.bergerkiller.bukkit.coasters.tracks;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Random;
 import java.util.Set;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 
+import com.bergerkiller.bukkit.coasters.objects.TrackObject;
 import com.bergerkiller.bukkit.coasters.rails.TrackRailsWorld;
+import com.bergerkiller.bukkit.common.bases.IntVector3;
+import com.bergerkiller.bukkit.common.offline.OfflineWorld;
+import com.bergerkiller.bukkit.tc.rails.RailLookup;
+import com.bergerkiller.bukkit.tc.rails.WorldRailLookup;
+import com.google.common.collect.Iterables;
 import org.bukkit.Location;
 import org.bukkit.util.Vector;
 
@@ -18,6 +27,7 @@ import com.bergerkiller.bukkit.coasters.world.CoasterWorldComponent;
 import com.bergerkiller.bukkit.common.math.Matrix4x4;
 import com.bergerkiller.bukkit.common.math.Quaternion;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
+import com.bergerkiller.bukkit.common.utils.MathUtil;
 
 /**
  * Stores all the track groups and the special connections between track nodes.
@@ -28,6 +38,7 @@ public class TrackWorld implements CoasterWorldComponent {
     private final List<TrackCoaster> _coasters;
     private final NodeUpdateList _changedNodes = new NodeUpdateList();
     private final NodeUpdateList _changedNodesPriority = new NodeUpdateList();
+    private final LoadMetrics _loadMetrics = new LoadMetrics();
 
     public TrackWorld(CoasterWorld world) {
         this._world = world;
@@ -436,11 +447,31 @@ public class TrackWorld implements CoasterWorldComponent {
     /**
      * Attempts making a connection using the connection state provided.
      * If no nodes exist at the positions inside the state, the operation fails and null is returned.
-     * 
+     *
      * @param state
      * @return created connection, null on failure
      */
     public TrackConnection connect(TrackConnectionState state, boolean addObjects) {
+        TrackConnection connection = connectWithoutAddingObjects(state);
+        if (connection != null && addObjects && state.hasObjects()) {
+            // Collect a list of objects that already exist on the connection
+            List<TrackObject> existingObjects = connection.getObjects();
+
+            // Add objects, but it is possible that the same connection already existed
+            // So do verify the objects aren't already all added
+            connection.addAllObjects(state, (conn, o) -> !Iterables.any(existingObjects, existing -> existing.isSameAs(o)));
+        }
+        return connection;
+    }
+
+    /**
+     * Attempts making a connection using the connection state provided.
+     * If no nodes exist at the positions inside the state, the operation fails and null is returned.
+     * 
+     * @param state TrackConnectionState
+     * @return created connection, null on failure
+     */
+    private TrackConnection connectWithoutAddingObjects(TrackConnectionState state) {
         TrackNode nodeA, nodeB;
         if (state.node_a.isExistingNode()) {
             // If both are specified as an existing node, then do the normal connect() logic
@@ -448,32 +479,34 @@ public class TrackWorld implements CoasterWorldComponent {
                 return connect((TrackNode) state.node_a, (TrackNode) state.node_b);
             }
 
-            // Try to find an existing connection with node_b reference
+            // Resolve exact node_b first. Node references can be position-based, and if two nodes
+            // occupy that same position then we must not merge by position at this stage.
             nodeA = (TrackNode) state.node_a;
-            TrackConnection existing = nodeA.findConnectionWithReference(state.node_b);
-            if (existing != null) {
-                return existing;
+            if ((nodeB = findNodeForConnection(state.node_b, nodeA, nodeA)) == null) {
+                return null;
             }
 
-            // Find node_b, if not found, fail
-            if ((nodeB = state.node_b.findOnWorld(this, nodeA)) == null) {
-                return null;
+            // Try to find an existing connection with this exact node
+            TrackConnection existing = nodeA.findConnectionWithNode(nodeB);
+            if (existing != null) {
+                return existing;
             }
         } else if (state.node_b.isExistingNode()) {
-            // Try to find an existing connection with node_a reference
+            // Resolve exact node_a first. Node references can be position-based, and if two nodes
+            // occupy that same position then we must not merge by position at this stage.
             nodeB = (TrackNode) state.node_b;
-            TrackConnection existing = nodeB.findConnectionWithReference(state.node_a);
+            if ((nodeA = findNodeForConnection(state.node_a, nodeB, nodeB)) == null) {
+                return null;
+            }
+
+            // Try to find an existing connection with this exact node
+            TrackConnection existing = nodeB.findConnectionWithNode(nodeA);
             if (existing != null) {
                 return existing;
             }
-
-            // Find node_a, if not found, fail
-            if ((nodeA = state.node_a.findOnWorld(this, nodeB)) == null) {
-                return null;
-            }
         } else {
-            nodeA = state.node_a.findOnWorld(this, null);
-            nodeB = state.node_b.findOnWorld(this, nodeA);
+            nodeA = findNodeForConnection(state.node_a, null, null);
+            nodeB = findNodeForConnection(state.node_b, nodeA, nodeA);
 
             // Either node not found, fail
             if (nodeA == null || nodeB == null) {
@@ -494,11 +527,70 @@ public class TrackWorld implements CoasterWorldComponent {
         }
 
         // Create a new connection
-        TrackConnection connection = this.addConnection(nodeA, nodeB);
-        if (addObjects) {
-            connection.addAllObjects(state);
+        return this.addConnection(nodeA, nodeB);
+    }
+
+    /**
+     * Looks up a node by a previously saved node reference (position). Has special handling of straightened nodes, where two
+     * nodes can occupy the same position. Then it matches the node with the best-matching up-orientation.
+     *
+     * @param nodeRef Node reference to look up
+     * @param excludedNode If multiple track nodes exist at a position, makes sure to
+     *                     exclude this node. Ignored if null.
+     * @param otherNode If multiple track nodes exist at a position, makes sure to select the node that has the best-matching up-orientation with this node. Ignored if null.
+     * @return node at the position, null if not found
+     */
+    private TrackNode findNodeForConnection(TrackNodeReference nodeRef, TrackNode excludedNode, TrackNode otherNode) {
+        TrackNode node = nodeRef.findOnWorld(this, excludedNode);
+        if (node == null || otherNode == null || nodeRef.isExistingNode()) {
+            return node;
         }
-        return connection;
+
+        TrackNode zeroNeighbour = node.getZeroDistanceNeighbour();
+        if (zeroNeighbour == null || zeroNeighbour == excludedNode) {
+            return node;
+        }
+
+        if (scoreConnectionNode(node, otherNode) <= scoreConnectionNode(zeroNeighbour, otherNode)) {
+            return node;
+        } else {
+            return zeroNeighbour;
+        }
+    }
+
+    /**
+     * Creates a score for how well a node is connected to another node. The lower the score, the better the connection.
+     * This is called when connecting one node to another node that has a straightened orphan node at the same position.
+     * Then we want to connect to the node that has the best-matching orientation.
+     *
+     * @param candidateNode Node to score
+     * @param otherNode Node to score against
+     * @return score, lower is better
+     */
+    private static double scoreConnectionNode(TrackNode candidateNode, TrackNode otherNode) {
+        Vector direction = candidateNode.getPosition().clone().subtract(otherNode.getPosition());
+        double directionLenSq = direction.lengthSquared();
+        if (directionLenSq <= 1e-20) {
+            return Double.MAX_VALUE;
+        }
+        direction.multiply(MathUtil.getNormalizationFactorLS(directionLenSq));
+
+        Vector otherUp = otherNode.getOrientation().clone();
+        Vector candidateUp = candidateNode.getOrientation().clone();
+        otherUp.subtract(direction.clone().multiply(otherUp.dot(direction)));
+        candidateUp.subtract(direction.clone().multiply(candidateUp.dot(direction)));
+
+        double otherUpLenSq = otherUp.lengthSquared();
+        if (otherUpLenSq > 1e-20) {
+            otherUp.multiply(MathUtil.getNormalizationFactorLS(otherUpLenSq));
+        }
+
+        double candidateUpLenSq = candidateUp.lengthSquared();
+        if (candidateUpLenSq > 1e-20) {
+            candidateUp.multiply(MathUtil.getNormalizationFactorLS(candidateUpLenSq));
+        }
+
+        return -otherUp.dot(candidateUp);
     }
 
     /**
@@ -681,6 +773,8 @@ public class TrackWorld implements CoasterWorldComponent {
     public void load() {
         this.clear();
 
+        long startTimeNanos = System.nanoTime();
+
         // List all coasters saved on disk. List both .csv and .csv.tmp coasters.
         HashSet<String> coasterNames = new HashSet<String>();
         File[] filesInFolder = this.getWorld().getConfigFolder().listFiles();
@@ -712,29 +806,77 @@ public class TrackWorld implements CoasterWorldComponent {
             coaster.markUnchanged();
         }
 
+        _loadMetrics.loadTimeSeconds = (double) (System.nanoTime() - startTimeNanos) / 1000000000.0;
+
         // Apply pending node changes and rebuild all track-rail information
         rebuild();
     }
 
     /**
      * Updates all nodes that have changed and rebuilds all track information
-     * of {@link TrackRailsWorld}
+     * of {@link TrackRailsWorld}. Metrics collected in this operation can be retrieved
+     * using {@link #getLoadMetrics()}.
      */
     public void rebuild() {
+        // Reset
+        _loadMetrics.updateTimeSeconds = 0.0;
+        _loadMetrics.rebuildTimeSeconds = 0.0;
+
+        long startTimeNanos = System.nanoTime();
+
         // Ensure all updates have been notified/completed
         this._changedNodesPriority.clear(); // At this stage this shouldn't even contain elements
         runAllUpdates(this._changedNodes, false);
 
+        long afterUpdateTimeNanos = System.nanoTime();
+        _loadMetrics.updateTimeSeconds = (double) (afterUpdateTimeNanos - startTimeNanos) / 1000000000.0;
+
+        // Before we rebuild, wipe the traincarts rail cache by forcing verification
+        // Avoids massive overhead when we clear later, and we also don't have to
+        // commit every changed block on initial store. With a rebuild, that's a lot of blocks!
+        RailLookup.forceRecalculation();
+
         // Rebuild all rail-tracked information of all nodes on this world
-        {
+        try {
             TrackRailsWorld rails = getWorld().getRails();
             rails.clear();
-            for (TrackCoaster coaster : getCoasters()) {
-                for (TrackNode node : coaster.getNodes()) {
-                    rails.store(node);
+
+            // For debug: randomize the order of the nodes before rebuilding
+            // This can be used to find and reproduce track rails section bugs that
+            // are caused by specific orders of merging.
+            if (isRandomizeRebuildEnabled()) {
+                List<TrackNode> allNodes = getCoasters().stream()
+                        .flatMap(c -> c.getNodes().stream())
+                        .collect(Collectors.toCollection(ArrayList::new));
+
+                long seed = new Random().nextLong();
+                // seed = 123L;
+                System.out.println("== Rebuilding with " + seed + " ==");
+                Collections.shuffle(allNodes, new Random(seed));
+                allNodes.forEach(rails::store);
+            } else {
+                for (TrackCoaster coaster : getCoasters()) {
+                    for (TrackNode node : coaster.getNodes()) {
+                        rails.store(node);
+                    }
                 }
             }
+        } finally {
+            _loadMetrics.rebuildTimeSeconds = (double) (System.nanoTime() - afterUpdateTimeNanos) / 1000000000.0;
         }
+    }
+
+    /**
+     * Gets metrics about the last time {@link #load()} and/or {@link #rebuild()} was called.
+     *
+     * @return Load metrics
+     */
+    public LoadMetrics getLoadMetrics() {
+        return _loadMetrics;
+    }
+
+    private boolean isRandomizeRebuildEnabled() {
+        return false;
     }
 
     /**
@@ -796,9 +938,17 @@ public class TrackWorld implements CoasterWorldComponent {
                 this.getWorld().getRails().purge(nodesToUpdate);
 
                 // Re-create all the cached rail information for the changed nodes
+                // Keep track of what blocks saw a change in track behavior
+                final Set<IntVector3> changedBlocks = new HashSet<>();
+                final OfflineWorld world = getOfflineWorld();
                 for (TrackNode changedNode : nodesToUpdate) {
-                    this.getWorld().getRails().store(changedNode);
+                    this.getWorld().getRails().store(changedNode, changedBlocks::add);
                 }
+
+                // For all blocks that had changes, invalidate the rail lookup cache there
+                // Otherwise information may stay stuck getting stored, breaking train pathing
+                final WorldRailLookup lookup = RailLookup.forWorld(getBukkitWorld());
+                changedBlocks.forEach(lookup::redetectRailsAtBlock);
             }
             updates.clear();
         }
@@ -902,6 +1052,23 @@ public class TrackWorld implements CoasterWorldComponent {
 
         /* Connection not found */
         return false;
+    }
+
+    /**
+     * Metrics collected about the last time {@link #rebuild()} was called. This happens through commands and
+     * on plugin startup.
+     */
+    public static class LoadMetrics {
+        /** Time spent loading the coasters from disk in seconds */
+        public double loadTimeSeconds;
+        /** Time spent in seconds processing track updates before the actual rebuilding */
+        public double updateTimeSeconds;
+        /** Time spent building the track in seconds */
+        public double rebuildTimeSeconds;
+
+        public double totalTime() {
+            return loadTimeSeconds + updateTimeSeconds + rebuildTimeSeconds;
+        }
     }
 
     private static final class NodeUpdateList {

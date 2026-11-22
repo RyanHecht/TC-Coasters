@@ -1,7 +1,9 @@
 package com.bergerkiller.bukkit.coasters.tracks;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Iterator;
 import java.util.List;
 
 import org.bukkit.util.Vector;
@@ -215,6 +217,81 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
     }
 
     /**
+     * Updates, removes and/or adds track objects to synchronize it with the objects
+     * stored in a connection state. A clone of the objects is
+     * created to guarantee the immutability of the track connection state.
+     * If the track object occupies the exact same position and width, an attempt
+     * is made to update the existing object instead of deleting and re-adding it.
+     *
+     * @param connectionObjects TrackConnectionState with objects to set
+     */
+    public void setAllObjects(TrackConnectionState connectionObjects) {
+        if (!connectionObjects.hasObjects()) {
+            this.clearObjects();
+            return;
+        }
+
+        int numExpectedObjects = connectionObjects.getObjects().size();
+        List<TrackObject> expectedObjects = new ArrayList<>(numExpectedObjects);
+        List<TrackObject> updatedObjects = new ArrayList<>(numExpectedObjects);
+        List<TrackObject> removedObjects = new ArrayList<>(Arrays.asList(this.objects));
+
+        // Identify the track objects that must exist as part of the connection state
+        if (connectionObjects.isSameFlipped(this)) {
+            for (TrackObject object : connectionObjects.getObjects()) {
+                expectedObjects.add(object.cloneFlipEnds(this));
+            }
+        } else {
+            for (TrackObject object : connectionObjects.getObjects()) {
+                expectedObjects.add(object.clone());
+            }
+        }
+
+        // Go by previous track objects. If they are 100% identical with one of the expected objects,
+        // undo removal and keep it as an updated unchanged object.
+        for (Iterator<TrackObject> remIter = removedObjects.iterator(); remIter.hasNext();) {
+            TrackObject removed = remIter.next();
+            for (Iterator<TrackObject> expectedIter = expectedObjects.iterator(); expectedIter.hasNext();) {
+                TrackObject expected = expectedIter.next();
+                if (removed.isSamePositionAs(expected) && removed.getType().equals(expected.getType())) {
+                    updatedObjects.add(removed);
+                    remIter.remove();
+                    expectedIter.remove();
+                    break;
+                }
+            }
+        }
+
+        // Go by previous track objects. If they are positioned at the exact same position, update the type in place
+        // This causes a 'swap' of the represented object display
+        for (Iterator<TrackObject> remIter = removedObjects.iterator(); remIter.hasNext();) {
+            TrackObject removed = remIter.next();
+            for (Iterator<TrackObject> expectedIter = expectedObjects.iterator(); expectedIter.hasNext();) {
+                TrackObject expected = expectedIter.next();
+                if (removed.isSamePositionAs(expected)) {
+                    removed.setType(this, expected.getType());
+                    updatedObjects.add(removed);
+                    remIter.remove();
+                    expectedIter.remove();
+                    break;
+                }
+            }
+        }
+
+        // For all remaining removed objects, remove them officially
+        removedObjects.forEach(o -> o.onRemoved(this));
+
+        // For all remaining expected objects, add them as they are
+        updatedObjects.addAll(expectedObjects);
+
+        // Update objects array, then fire onAdded for newly added objects
+        // Fire markChanged() all the time, this stuff is too dynamic to safely test for changes
+        this.objects = updatedObjects.toArray(TrackObject.EMPTY);
+        this.markChanged();
+        expectedObjects.forEach(newlyAdded -> newlyAdded.onAdded(this));
+    }
+
+    /**
      * Adds multiple track objects at once
      *
      * @param objects
@@ -295,6 +372,20 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
             }
         }
         return false;
+    }
+
+    /**
+     * Removes all objects that exist for this connection
+     */
+    public void clearObjects() {
+        TrackObject[] objects = this.objects;
+        if (objects.length > 0) {
+            this.objects = TrackObject.EMPTY;
+            this.markChanged();
+            for (TrackObject object : objects) {
+                object.onRemoved(this);
+            }
+        }
     }
 
     /**
@@ -683,21 +774,39 @@ public class TrackConnection implements Lockable, CoasterWorldComponent, TrackOb
     }
 
     /**
+     * A single Point on a connection, but without information about the connection and distance
+     * from the start this point is at.
+     */
+    public static class Point {
+        /** World position */
+        public final Vector position;
+        /** Orientation (up vector) along the path direction (tangent) */
+        public final Quaternion orientation;
+
+        public Point(Vector position, Quaternion orientation) {
+            this.position = position;
+            this.orientation = orientation;
+        }
+
+        @Override
+        public String toString() {
+            return "{x=" + position.getX() + ", y=" + position.getY() + ", z=" + position.getZ() + "}";
+        }
+    }
+
+    /**
      * A point on the track connection path
      */
-    public static final class PointOnPath {
+    public static final class PointOnPath extends Point {
         public final TrackConnection connection;
         public final double theta;
         public final double distance;
-        public final Vector position;
-        public final Quaternion orientation;
 
         public PointOnPath(TrackConnection connection, double theta, double distance, Vector position, Quaternion orientation) {
+            super(position, orientation);
             this.connection = connection;
             this.theta = theta;
             this.distance = distance;
-            this.position = position;
-            this.orientation = orientation;
         }
 
         public CoasterWorld getWorld() {

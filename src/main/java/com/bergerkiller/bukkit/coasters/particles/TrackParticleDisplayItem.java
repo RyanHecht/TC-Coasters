@@ -1,10 +1,12 @@
 package com.bergerkiller.bukkit.coasters.particles;
 
+import com.bergerkiller.bukkit.coasters.objects.lod.LODItemStack;
 import com.bergerkiller.bukkit.coasters.util.QueuedTask;
 import com.bergerkiller.bukkit.coasters.util.VirtualDisplayEntity;
 import com.bergerkiller.bukkit.common.collections.octree.DoubleOctree;
 import com.bergerkiller.bukkit.common.math.Quaternion;
 import com.bergerkiller.bukkit.common.utils.MathUtil;
+import com.bergerkiller.bukkit.common.wrappers.Brightness;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.Vector;
@@ -17,7 +19,8 @@ public class TrackParticleDisplayItem extends TrackParticle {
     protected static final int FLAG_TRANSFORM_CHANGED = (1<<3);
     protected static final int FLAG_ITEM_CHANGED      = (1<<4);
     protected static final int FLAG_CLIP_CHANGED      = (1<<5);
-    protected static final int FLAG_LARGE_CHANGES     = (1<<6);
+    protected static final int FLAG_BRIGHTNESS_CHANGED = (1<<6);
+    protected static final int FLAG_LARGE_CHANGES     = (1<<7);
 
     private static final QueuedTask<TrackParticleDisplayItem> DESPAWN_HOLDER_TASK = QueuedTask.create(
             100, TrackParticle::isAdded, TrackParticleDisplayItem::destroyHolderEntity);
@@ -25,17 +28,22 @@ public class TrackParticleDisplayItem extends TrackParticle {
     private DoubleOctree.Entry<TrackParticle> position;
     private final Quaternion orientation;
     private double clip;
+    private Brightness brightness;
     private final Vector size;
-    private ItemStack item;
+    private LODItemStack.List lodList;
     private int holderEntityId = -1;
     private int entityId = -1;
 
-    protected TrackParticleDisplayItem(Vector position, Quaternion orientation, double clip, Vector size, ItemStack item) {
+    protected TrackParticleDisplayItem(Vector position, Quaternion orientation, double clip, Brightness brightness, Vector size, LODItemStack.List lodList) {
+        if (lodList == null) {
+            throw new IllegalArgumentException("LOD Item List cannot be null");
+        }
         this.position = DoubleOctree.Entry.create(position, this);
         this.orientation = orientation.clone();
         this.clip = clip;
+        this.brightness = brightness;
         this.size = size.clone();
-        this.item = item;
+        this.lodList = lodList;
     }
 
     public void setPositionOrientation(Vector position, Quaternion orientation) {
@@ -65,6 +73,14 @@ public class TrackParticleDisplayItem extends TrackParticle {
         }
     }
 
+    public void setBrightness(Brightness brightness) {
+        if (this.brightness != brightness) {
+            this.brightness = brightness;
+            this.setFlag(FLAG_BRIGHTNESS_CHANGED);
+            this.scheduleUpdateAppearance();
+        }
+    }
+
     public void setSize(Vector size) {
         if (!this.size.equals(size)) {
             MathUtil.setVector(this.size, size);
@@ -74,8 +90,15 @@ public class TrackParticleDisplayItem extends TrackParticle {
     }
 
     public void setItem(ItemStack item) {
-        if (this.item != item && !this.item.equals(item)) {
-            this.item = item;
+        setLODItems(LODItemStack.createList(item));
+    }
+
+    public void setLODItems(LODItemStack.List lodList) {
+        if (lodList == null) {
+            throw new IllegalArgumentException("LOD Item List cannot be null");
+        }
+        if (!this.lodList.equals(lodList)) {
+            this.lodList = lodList;
             this.setFlag(FLAG_ITEM_CHANGED);
             this.scheduleUpdateAppearance();
         }
@@ -98,14 +121,37 @@ public class TrackParticleDisplayItem extends TrackParticle {
 
     @Override
     public void makeVisibleFor(Player viewer) {
+        makeVisibleFor(viewer, this.lodList.getNearest().getItem());
+    }
+
+    @Override
+    public TrackParticleLifecycle getLifecycle(State state) {
+        if (lodList.isSingleLOD()) {
+            return this;
+        } else {
+            return new LODLifecycle(lodList, lodList.getForDistance(state.getViewDistance()));
+        }
+    }
+
+    @Override
+    public boolean isLifecycleValid(State state) {
+        return lodList.isSingleLOD();
+    }
+
+    private VirtualDisplayEntity createItemDisplayEntity() {
+        return VirtualDisplayEntity.createItem(this.holderEntityId, this.entityId);
+    }
+
+    private void makeVisibleFor(Player viewer, ItemStack item) {
         TrackParticleState state = getState(viewer);
 
-        VirtualDisplayEntity entity = VirtualDisplayEntity.createItem(this.holderEntityId, this.entityId)
+        VirtualDisplayEntity entity = createItemDisplayEntity()
                 .position(this.position)
                 .orientation(this.orientation)
                 .clip(this.clip)
                 .scale(this.size)
-                .item(this.item)
+                .brightness(this.brightness)
+                .item(item)
                 .glowing(state == TrackParticleState.SELECTED)
                 .spawn(viewer);
         this.holderEntityId = entity.holderEntityId();
@@ -148,14 +194,27 @@ public class TrackParticleDisplayItem extends TrackParticle {
                 .updateMetadata(this.getViewers());
         }
         if (this.clearFlag(FLAG_ITEM_CHANGED) && this.entityId != -1) {
-            VirtualDisplayEntity.createItem(this.holderEntityId, this.entityId)
-                .item(this.item)
-                .updateMetadata(this.getViewers());
+            if (lodList.isSingleLOD()) {
+                // Update directly
+                createItemDisplayEntity()
+                        .item(this.lodList.getNearest().getItem())
+                        .updateMetadata(this.getViewers());
+            } else {
+                // Must force players in view to refresh LOD
+                for (Player viewer : getViewers()) {
+                    getWorld().scheduleViewerUpdate(viewer);
+                }
+            }
         }
         if (this.clearFlag(FLAG_CLIP_CHANGED) && this.entityId != -1) {
             VirtualDisplayEntity.createItem(this.holderEntityId, this.entityId)
                     .clip(this.clip)
                     .scale(this.size) // Needed for calculations
+                    .updateMetadata(this.getViewers());
+        }
+        if (this.clearFlag(FLAG_BRIGHTNESS_CHANGED) && this.entityId != -1) {
+            VirtualDisplayEntity.createItem(this.holderEntityId, this.entityId)
+                    .brightness(this.brightness)
                     .updateMetadata(this.getViewers());
         }
     }
@@ -176,5 +235,45 @@ public class TrackParticleDisplayItem extends TrackParticle {
     @Override
     public boolean usesEntityId(int entityId) {
         return this.holderEntityId == entityId || this.entityId == entityId;
+    }
+
+    /**
+     * Used for different LODs, if configured that way
+     */
+    private class LODLifecycle implements TrackParticleLifecycle {
+        private final LODItemStack.List lodListUsed; // For detecting changes in item
+        private final LODItemStack lod;
+
+        public LODLifecycle(LODItemStack.List lodList, LODItemStack lod) {
+            this.lodListUsed = lodList;
+            this.lod = lod;
+        }
+
+        @Override
+        public void makeVisibleFor(Player viewer) {
+            TrackParticleDisplayItem.this.makeVisibleFor(viewer, lod.getItem());
+        }
+
+        @Override
+        public void makeHiddenFor(Player viewer) {
+            TrackParticleDisplayItem.this.makeHiddenFor(viewer);
+        }
+
+        @Override
+        public boolean isLifecycleValid(State state) {
+            return lodList == lodListUsed && lod.isForDistance(state.getViewDistance());
+        }
+
+        @Override
+        public void switchFromLifecycle(TrackParticleLifecycle oldLifecycle, Player viewer) {
+            if (oldLifecycle instanceof LODLifecycle) {
+                // Only have to update the displayed item
+                createItemDisplayEntity()
+                        .item(this.lod.getItem())
+                        .updateMetadata(viewer);
+            } else {
+                TrackParticleLifecycle.super.switchFromLifecycle(oldLifecycle, viewer);
+            }
+        }
     }
 }

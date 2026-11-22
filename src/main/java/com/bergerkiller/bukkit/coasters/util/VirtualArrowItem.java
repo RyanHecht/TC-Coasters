@@ -15,13 +15,13 @@ import com.bergerkiller.bukkit.common.utils.EntityUtil;
 import com.bergerkiller.bukkit.common.utils.PacketUtil;
 import com.bergerkiller.bukkit.common.wrappers.DataWatcher;
 import com.bergerkiller.bukkit.tc.Util;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityDestroyHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityEquipmentHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityMetadataHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityTeleportHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutSpawnEntityLivingHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEquipmentPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEntityDataPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundAddMobPacketHandle;
 import com.bergerkiller.generated.net.minecraft.world.entity.EntityHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.decoration.EntityArmorStandHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.decoration.ArmorStandHandle;
 
 /**
  * Helper class for spawning and updating a virtual arrow item.
@@ -30,6 +30,14 @@ import com.bergerkiller.generated.net.minecraft.world.entity.decoration.EntityAr
  */
 public class VirtualArrowItem {
     private static final Vector UP_ARM_OFFSET = new Vector(0.05, -0.05, -0.56);
+
+    private static final DataWatcher.Prototype SPAWN_METADATA = DataWatcher.Prototype.build()
+            .set(EntityHandle.DATA_NO_GRAVITY, true)
+            .setClientByteDefault(EntityHandle.DATA_FLAGS, 0)
+            .setByte(ArmorStandHandle.DATA_ARMORSTAND_FLAGS, ArmorStandHandle.DATA_FLAG_SET_MARKER | ArmorStandHandle.DATA_FLAG_NO_BASEPLATE)
+            .setClientDefault(ArmorStandHandle.DATA_POSE_ARM_RIGHT, new Vector(15.0, 0.0, 10.0))
+            .create();
+
     private int entityId;
     private boolean glowing = false;
     private double posX, posY, posZ;
@@ -99,14 +107,14 @@ public class VirtualArrowItem {
      */
     public VirtualArrowItem move(Iterable<Player> viewers) {
         if (this.entityId != -1) {
-            PacketPlayOutEntityTeleportHandle tpPacket = PacketPlayOutEntityTeleportHandle.createNew(
+            ClientboundEntityPositionSyncPacketHandle tpPacket = ClientboundEntityPositionSyncPacketHandle.createNew(
                     this.entityId,
                     this.posX,  this.posY,  this.posZ,
                     0.0f, 0.0f, false);
 
             DataWatcher metadata = new DataWatcher();
-            metadata.set(EntityArmorStandHandle.DATA_POSE_ARM_RIGHT, this.rotation);
-            PacketPlayOutEntityMetadataHandle metaPacket = PacketPlayOutEntityMetadataHandle.createNew(this.entityId, metadata, true);
+            metadata.set(ArmorStandHandle.DATA_POSE_ARM_RIGHT, this.rotation);
+            ClientboundSetEntityDataPacketHandle metaPacket = ClientboundSetEntityDataPacketHandle.createNew(this.entityId, metadata, true);
 
             for (Player viewer : viewers) {
                 PacketUtil.sendPacket(viewer, tpPacket);
@@ -125,7 +133,7 @@ public class VirtualArrowItem {
      */
     public VirtualArrowItem updateItem(Player viewer) {
         if (this.entityId != -1) {
-            PacketPlayOutEntityEquipmentHandle equipPacket = PacketPlayOutEntityEquipmentHandle.createNew(
+            ClientboundSetEquipmentPacketHandle equipPacket = ClientboundSetEquipmentPacketHandle.createNew(
                     this.entityId, EquipmentSlot.HAND, this.item);
             PacketUtil.sendPacket(viewer, equipPacket);
         }
@@ -143,7 +151,7 @@ public class VirtualArrowItem {
         if (this.entityId != -1) {
             DataWatcher metadata = new DataWatcher();
             metadata.setByte(EntityHandle.DATA_FLAGS, computeFlags());
-            PacketPlayOutEntityMetadataHandle metaPacket = PacketPlayOutEntityMetadataHandle.createNew(this.entityId, metadata, true);
+            ClientboundSetEntityDataPacketHandle metaPacket = ClientboundSetEntityDataPacketHandle.createNew(this.entityId, metadata, true);
             PacketUtil.sendPacket(viewer, metaPacket);
         }
         return this;
@@ -154,13 +162,13 @@ public class VirtualArrowItem {
      * All properties must be set.
      * 
      * @param viewer Player to which to send the spawn packets
-     * @return entity id of the spawned entity (generated if -1 in {@link #create(entityId)})
+     * @return entity id of the spawned entity (generated if -1 in {@link #create(int)})
      */
     public int spawn(Player viewer) {
         if (this.entityId == -1) {
             this.entityId = EntityUtil.getUniqueEntityId();
         }
-        PacketPlayOutSpawnEntityLivingHandle spawnPacket = PacketPlayOutSpawnEntityLivingHandle.T.newHandleNull();
+        ClientboundAddMobPacketHandle spawnPacket = ClientboundAddMobPacketHandle.createNew();
         spawnPacket.setEntityId(this.entityId);
         spawnPacket.setEntityUUID(UUID.randomUUID());
         spawnPacket.setEntityType(EntityType.ARMOR_STAND);
@@ -168,15 +176,13 @@ public class VirtualArrowItem {
         spawnPacket.setPosY(posY);
         spawnPacket.setPosZ(posZ);
 
-        DataWatcher metadata = new DataWatcher();
-        metadata.set(EntityHandle.DATA_NO_GRAVITY, true);
+        DataWatcher metadata = SPAWN_METADATA.create();
         metadata.setByte(EntityHandle.DATA_FLAGS, computeFlags());
-        metadata.setByte(EntityArmorStandHandle.DATA_ARMORSTAND_FLAGS, EntityArmorStandHandle.DATA_FLAG_SET_MARKER | EntityArmorStandHandle.DATA_FLAG_NO_BASEPLATE);
-        metadata.set(EntityArmorStandHandle.DATA_POSE_ARM_RIGHT, rotation);
+        metadata.set(ArmorStandHandle.DATA_POSE_ARM_RIGHT, rotation);
 
         PacketUtil.sendEntityLivingSpawnPacket(viewer, spawnPacket, metadata);
 
-        PacketPlayOutEntityEquipmentHandle equipPacket = PacketPlayOutEntityEquipmentHandle.createNew(
+        ClientboundSetEquipmentPacketHandle equipPacket = ClientboundSetEquipmentPacketHandle.createNew(
                 this.entityId, EquipmentSlot.HAND, this.item);
         PacketUtil.sendPacket(viewer, equipPacket);
 
@@ -202,7 +208,7 @@ public class VirtualArrowItem {
      */
     public void destroy(Player viewer) {
         if (this.entityId != -1) {
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewSingle(this.entityId));
+            PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewSingle(this.entityId));
         }
     }
 

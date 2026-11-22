@@ -1,12 +1,15 @@
 package com.bergerkiller.bukkit.coasters.objects.display;
 
 import com.bergerkiller.bukkit.coasters.TCCoasters;
+import com.bergerkiller.bukkit.coasters.csv.TrackCSV;
 import com.bergerkiller.bukkit.coasters.csv.TrackCSV.TrackObjectTypeEntry;
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
 import com.bergerkiller.bukkit.coasters.editor.object.ui.DisplayTypePositionMenu;
 import com.bergerkiller.bukkit.coasters.editor.object.ui.ItemSelectMenu;
+import com.bergerkiller.bukkit.coasters.editor.object.ui.lod.ItemLODSelect;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectType;
 import com.bergerkiller.bukkit.coasters.objects.TrackObjectTypeItem;
+import com.bergerkiller.bukkit.coasters.objects.lod.LODItemStack;
 import com.bergerkiller.bukkit.coasters.particles.TrackParticleDisplayItem;
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.util.StringArrayBuffer;
@@ -17,9 +20,12 @@ import com.bergerkiller.bukkit.common.math.Matrix4x4;
 import com.bergerkiller.bukkit.common.utils.ItemUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.utils.MaterialUtil;
+import com.bergerkiller.bukkit.common.wrappers.Brightness;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.Vector;
 
+import java.util.List;
+import java.util.Objects;
 import java.util.function.Supplier;
 
 /**
@@ -28,27 +34,33 @@ import java.util.function.Supplier;
 public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<TrackParticleDisplayItem>, TrackObjectTypeItem<TrackParticleDisplayItem> {
     private final double width;
     private final Matrix4x4 transform;
-    private final ItemStack item;
+    private final LODItemStack.List lodList;
     private final double clip;
+    private final Brightness brightness;
     private final Vector size;
 
-    private TrackObjectTypeDisplayItemStack(double width, Matrix4x4 transform, double clip, Vector size, ItemStack item) {
-        if (item == null) {
+    private TrackObjectTypeDisplayItemStack(double width, Matrix4x4 transform, double clip, Brightness brightness, Vector size, LODItemStack.List lodList) {
+        if (lodList == null) {
             throw new IllegalArgumentException("Item can not be null");
         }
         this.width = width;
         this.transform = transform;
         this.clip = clip;
         this.size = size;
-        this.item = item;
+        this.brightness = brightness;
+        this.lodList = lodList;
     }
 
-    public static TrackObjectTypeDisplayItemStack create(double width, double clip, Vector size, ItemStack item) {
-        return new TrackObjectTypeDisplayItemStack(width, null, clip, size, item);
+    public static TrackObjectTypeDisplayItemStack create(double width, double clip, Brightness brightness, Vector size, ItemStack item) {
+        return create(width, clip, brightness, size, LODItemStack.createList(item));
+    }
+
+    public static TrackObjectTypeDisplayItemStack create(double width, double clip, Brightness brightness, Vector size, LODItemStack.List lodList) {
+        return new TrackObjectTypeDisplayItemStack(width, null, clip, brightness, size, lodList);
     }
 
     public static TrackObjectTypeDisplayItemStack createDefault() {
-        return create(0.0, 0.0, new Vector(1.0, 1.0, 1.0),
+        return create(0.0, 0.0, Brightness.UNSET, new Vector(1.0, 1.0, 1.0),
                 new ItemStack(MaterialUtil.getFirst("OAK_PLANKS", "LEGACY_WOOD")));
     }
 
@@ -64,7 +76,7 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public TrackObjectTypeDisplayItemStack setWidth(double width) {
-        return new TrackObjectTypeDisplayItemStack(width, this.transform, this.clip, this.size, this.item);
+        return new TrackObjectTypeDisplayItemStack(width, this.transform, this.clip, this.brightness, this.size, this.lodList);
     }
 
     @Override
@@ -74,17 +86,17 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public TrackObjectTypeDisplayItemStack setTransform(Matrix4x4 transform) {
-        return new TrackObjectTypeDisplayItemStack(this.width, transform, this.clip, this.size, this.item);
+        return new TrackObjectTypeDisplayItemStack(this.width, transform, this.clip, this.brightness, this.size, this.lodList);
     }
 
     @Override
-    public ItemStack getItem() {
-        return this.item;
+    public LODItemStack.List getLODItems() {
+        return this.lodList;
     }
 
     @Override
-    public TrackObjectTypeDisplayItemStack setItem(ItemStack item) {
-        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, this.clip, this.size, item);
+    public TrackObjectTypeDisplayItemStack setLODItems(LODItemStack.List lodList) {
+        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, this.clip, this.brightness, this.size, lodList);
     }
 
     @Override
@@ -94,7 +106,17 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public TrackObjectTypeDisplayItemStack setClip(double clip) {
-        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, clip, this.size, this.item);
+        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, clip, this.brightness, this.size, this.lodList);
+    }
+
+    @Override
+    public Brightness getBrightness() {
+        return brightness;
+    }
+
+    @Override
+    public TrackObjectTypeDisplayItemStack setBrightness(Brightness brightness) {
+        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, this.clip, brightness, this.size, this.lodList);
     }
 
     @Override
@@ -104,23 +126,26 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public TrackObjectTypeDisplayItemStack setSize(Vector size) {
-        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, this.clip, size, this.item);
+        return new TrackObjectTypeDisplayItemStack(this.width, this.transform, this.clip, this.brightness, size, this.lodList);
     }
 
     @Override
     @SuppressWarnings("deprecation")
     public String generateName() {
-        if (ItemUtil.hasDurability(item)) {
-            return "I_D_" + item.getType() + "_" + item.getDurability();
+        ItemStack icon = lodList.getNearestNotHidden().getItem();
+        if (icon == null) {
+            return "I_D_UNSET";
+        } else if (ItemUtil.hasDurability(icon)) {
+            return "I_D_" + icon.getType() + "_" + icon.getDurability();
         } else {
-            return "I_D_" + item.getType();
+            return "I_D_" + icon.getType();
         }
     }
 
     @Override
     public TrackParticleDisplayItem createParticle(TrackConnection.PointOnPath point) {
         TrackParticleDisplayItem particle = point.getWorld().getParticles().addParticleDisplayItem(
-                point.position, point.orientation, this.clip, this.size, this.item);
+                point.position, point.orientation, this.clip, this.brightness, this.size, this.lodList);
         particle.setAlwaysVisible(true);
         return particle;
     }
@@ -129,23 +154,29 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
     public void updateParticle(TrackParticleDisplayItem particle, TrackConnection.PointOnPath point) {
         particle.setPositionOrientation(point.position, point.orientation);
         particle.setClip(this.clip);
+        particle.setBrightness(this.brightness);
         particle.setSize(this.size);
-        particle.setItem(this.item);
+        particle.setLODItems(this.lodList);
     }
 
     @Override
     public boolean isSameImage(TrackObjectType<?> type) {
-        return this.getItem().equals(((TrackObjectTypeDisplayItemStack) type).getItem());
+        return Objects.equals(this.getLODItems().getNearestNotHidden().getItem(),
+                ((TrackObjectTypeDisplayItemStack) type).getLODItems().getNearestNotHidden().getItem());
     }
 
     @Override
     public void drawImage(TCCoasters plugin, MapCanvas canvas) {
-        canvas.fillItem(plugin.getResourcePack(), this.item);
+        this.lodList.getNearestNotHidden().drawIcon(plugin, canvas);
     }
 
     @Override
     public void openMenu(MapWidget parent, Supplier<PlayerEditState> stateSupplier) {
-        parent.addWidget(new ItemSelectMenu(stateSupplier));
+        if (lodList.size() == 1) {
+            parent.addWidget(new ItemSelectMenu(stateSupplier));
+        } else {
+            parent.addWidget(new ItemLODSelect(stateSupplier));
+        }
     }
 
     @Override
@@ -155,12 +186,13 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public TrackObjectTypeDisplayItemStack acceptItem(ItemStack item) {
-        return this.setItem(item);
+        return this.setLODItems(this.lodList.update(0,
+                this.lodList.getItem(0).withItem(item)));
     }
 
     @Override
     public int hashCode() {
-        return this.item.hashCode();
+        return this.lodList.hashCode();
     }
 
     @Override
@@ -169,9 +201,10 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
             return true;
         } else if (o instanceof TrackObjectTypeDisplayItemStack) {
             TrackObjectTypeDisplayItemStack other = (TrackObjectTypeDisplayItemStack) o;
-            return this.item.equals(other.item) &&
+            return this.lodList.equals(other.lodList) &&
                    this.width == other.width &&
                    this.clip == other.clip &&
+                   this.brightness == other.brightness &&
                    this.size.equals(other.size) &&
                    LogicUtil.bothNullOrEqual(this.transform, other.transform);
         } else {
@@ -181,7 +214,7 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
     @Override
     public String toString() {
-        return "{TrackObjectType[ItemStack Display] item=" + this.item + "}";
+        return "{TrackObjectType[ItemStack Display] lod-items=" + this.lodList + "}";
     }
 
     /**
@@ -207,6 +240,7 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
 
             // Read additional display properties, keyed by name
             double clip = 0.0;
+            Brightness brightness = Brightness.UNSET;
             Vector size = new Vector(1.0, 1.0, 1.0);
             while (buffer.hasNext()) {
                 String propKey = buffer.next();
@@ -214,15 +248,36 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
                     clip = buffer.nextDouble();
                 } else if (propKey.equals("SIZE")) {
                     size = buffer.nextVector();
+                } else if (propKey.equals("BRIGHTNESS")) {
+                    brightness = buffer.nextBrightness();
                 }
             }
 
-            return TrackObjectTypeDisplayItemStack.create(this.width, clip, size, itemStack);
+            return TrackObjectTypeDisplayItemStack.create(this.width, clip, brightness, size, itemStack);
+        }
+
+        @Override
+        public void processReader(TrackCSV.CSVReaderState state) {
+            if (!state.pendingLODs.isEmpty()) {
+                LODItemStack.List lodList = objectType.getLODItems();
+                for (LODItemStack lodItem : state.pendingLODs) {
+                    lodList = lodList.addNewLOD(lodItem);
+                }
+                state.pendingLODs.clear();
+                objectType = objectType.setLODItems(lodList);
+            }
+
+            super.processReader(state);
+        }
+
+        @Override
+        public List<? extends TrackCSV.CSVEntry> getExtraCSVEntries() {
+            return objectType.getLODItems().encodeExtraLODsForCSV();
         }
 
         @Override
         public void writeDetails(StringArrayBuffer buffer, TrackObjectTypeDisplayItemStack objectType) {
-            buffer.putItemStack(objectType.getItem());
+            buffer.putItemStack(objectType.getLODItems().getNearest().getItem());
             if (objectType.getClip() != 0.0) {
                 buffer.put("CLIP");
                 buffer.putDouble(objectType.getClip());
@@ -233,6 +288,10 @@ public class TrackObjectTypeDisplayItemStack implements TrackObjectTypeDisplay<T
             ) {
                 buffer.put("SIZE");
                 buffer.putVector(objectType.getSize());
+            }
+            if (objectType.getBrightness() != Brightness.UNSET) {
+                buffer.put("BRIGHTNESS");
+                buffer.putBrightness(objectType.getBrightness());
             }
         }
     }

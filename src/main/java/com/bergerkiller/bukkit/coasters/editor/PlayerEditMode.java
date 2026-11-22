@@ -6,12 +6,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
+import com.bergerkiller.bukkit.coasters.editor.manipulation.NodeManipulationMode;
+import com.bergerkiller.bukkit.coasters.editor.manipulation.NodeManipulator;
+import com.bergerkiller.bukkit.coasters.editor.object.ui.lod.ItemLODSelectButton;
+import com.bergerkiller.bukkit.common.map.MapTexture;
+import com.bergerkiller.bukkit.common.map.widgets.MapWidget;
 import org.bukkit.ChatColor;
 import org.bukkit.block.BlockFace;
 
 import com.bergerkiller.bukkit.coasters.TCCoastersLocalization;
 import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
-import com.bergerkiller.bukkit.coasters.editor.object.ui.TypePositionMenu;
 import com.bergerkiller.bukkit.coasters.editor.object.ui.TypeSelectMenu;
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
@@ -28,37 +32,43 @@ import com.bergerkiller.bukkit.tc.attachments.ui.MapWidgetNumberBox;
 import com.bergerkiller.bukkit.tc.attachments.ui.MapWidgetSelectionBox;
 
 public enum PlayerEditMode {
-    DISABLED("Disabled (hidden)", 0, 1, PlayerEditMode::createEmptyView),
-    CREATE("Create Track", 20, 4, PlayerEditMode::createEmptyView),
-    POSITION("Change Position", 0, 1, PlayerEditMode::createPositionView),
-    ORIENTATION("Change Orientation", 0, 1, PlayerEditMode::createOrientationView),
-    RAILS("Change Rail Block", 0, 1, PlayerEditMode::createRailsView),
-    ANIMATION("Manage Animations", 0, 1, PlayerEditMode::createAnimationsView),
-    OBJECT("Track Objects", 10, 3, PlayerEditMode::createTrackObjectsView),
-    DELETE("Delete Track", 10, 3, PlayerEditMode::createEmptyView);
+    DISABLED("Disabled (hidden)", PlayerEditMode::createEmptyView, NodeManipulationMode.NONE),
+    BUILDER("Build Track", PlayerEditMode::createBuilderView, NodeManipulationMode.BUILDER),
+    POSITION("Adjust Track", PlayerEditMode::createPositionView, NodeManipulationMode.POSITION),
+    ORIENTATION("Change Orientation", PlayerEditMode::createOrientationView, NodeManipulationMode.ORIENTATION),
+    RAILS("Change Rail Block", PlayerEditMode::createRailsView, NodeManipulationMode.SET_RAIL_BLOCK),
+    ANIMATION("Manage Animations", PlayerEditMode::createAnimationsView, NodeManipulationMode.POSITION),
+    OBJECT("Track Objects", PlayerEditMode::createTrackObjectsView, NodeManipulationMode.OBJECT);
 
-    private final int _autoInterval;
-    private final int _autoDelay;
     private final String _name;
     private final BiConsumer<MapWidgetTabView.Tab, Supplier<PlayerEditState>> _createViewMethod;
+    private final NodeManipulationMode _manipulationMode;
 
     // name: displayed in the UI
     // autoDelay: how many ticks of holding right-click until continuously activating
     // autoInterval: tick interval of activation while holding right-click
-    private PlayerEditMode(String name, int autoDelay, int autoInterval, BiConsumer<MapWidgetTabView.Tab, Supplier<PlayerEditState>> createViewMethod) {
+    private PlayerEditMode(
+            final String name,
+            final BiConsumer<MapWidgetTabView.Tab, Supplier<PlayerEditState>> createViewMethod,
+            final NodeManipulationMode manipulationMode
+    ) {
         this._name = name;
-        this._autoDelay = autoDelay;
-        this._autoInterval = autoInterval;
         this._createViewMethod = createViewMethod;
-    }
-
-    public boolean autoActivate(int tick) {
-        tick -= this._autoDelay;
-        return tick >= 0 && (_autoInterval <= 0 || (tick % _autoInterval) == 0);
+        this._manipulationMode = manipulationMode;
     }
 
     public String getName() {
         return this._name;
+    }
+
+    /**
+     * Gets the node manipulation mode active while the Player is in this edit mode.
+     * This controls what happens when the Player presses or holds the right-click button.
+     *
+     * @return NodeManipulationMode
+     */
+    public NodeManipulationMode getManipulationMode() {
+        return this._manipulationMode;
     }
 
     public static PlayerEditMode fromName(String name) {
@@ -67,7 +77,7 @@ public enum PlayerEditMode {
                 return mode;
             }
         }
-        return CREATE;
+        return BUILDER;
     }
 
     /**
@@ -83,45 +93,234 @@ public enum PlayerEditMode {
     private static void createEmptyView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
     }
 
-    private static void createPositionView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
-        final int ADJ_BTN_WIDTH = 24;
-        final int ADJ_BTN_HEIGHT = 12;
-        final int ADJ_BTN_OFFSET = ADJ_BTN_WIDTH + 3;
-        int y = 5;
-        for (final char axis : new char[] { 'x', 'y', 'z'} ) {
+    private static void createBuilderView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
+        /** Build track button & state */
+        {
+            final int BASE_Y = 10;
+
             tab.addWidget(new MapWidgetText())
-                .setText("Align " + axis)
+                    .setText("/tcc create")
+                    .setColor(MapColorPalette.COLOR_WHITE)
+                    .setBounds(11, BASE_Y, 34, 13);
+
+            final MapTexture rightClickTexture = stateSupplier.get().getPlugin().loadTexture("com/bergerkiller/bukkit/coasters/resources/right_click.png");
+            tab.addWidget(new MapWidget() {
+                @Override
+                public void onDraw() {
+                    view.draw(rightClickTexture, 0, 0);
+                }
+            }).setBounds(77, BASE_Y - 4, rightClickTexture.getWidth(), rightClickTexture.getHeight());
+
+            tab.addWidget(new MapWidgetButton() {
+                @Override
+                public void onAttached() {
+                    super.onAttached();
+                    updateText();
+                }
+
+                @Override
+                public void onTick() {
+                    super.onTick();
+                    updateText();
+                }
+
+                @Override
+                public void onActivate() {
+                    PlayerEditState state = stateSupplier.get();
+                    try {
+                        state.createTrack();
+                    } catch (ChangeCancelledException e) {
+                        getDisplay().playSound(SoundEffect.EXTINGUISH);
+                        state.clearEditedNodes();
+                    }
+                }
+
+                private void updateText() {
+                    PlayerEditState.TrackBuilderPlan plan = stateSupplier.get().createTrackBuildPlan();
+                    if (plan.spaceOccupied) {
+                        this.setText("Occupied");
+                        this.setEnabled(false);
+                    } else if (!plan.connectionsToSplit.isEmpty()) {
+                        this.setText("Split Middle");
+                        this.setEnabled(true);
+                    } else if (!plan.nodesToConnect.isEmpty()) {
+                        if (plan.isInAir) {
+                            this.setText("Connect");
+                        } else {
+                            this.setText("Build & Connect");
+                        }
+                        this.setEnabled(true);
+                    } else {
+                        this.setText("Build Node");
+                        this.setEnabled(true);
+                    }
+                }
+            }).setBounds(11, BASE_Y + 10, 96, 13);
+        }
+
+        /** Delete track button & state */
+        {
+            final int BASE_Y = 39;
+
+            tab.addWidget(new MapWidgetText())
+                    .setText("/tcc delete")
+                    .setColor(MapColorPalette.COLOR_WHITE)
+                    .setBounds(11, BASE_Y, 34, 13);
+
+            tab.addWidget(new MapWidgetButton() {
+                @Override
+                public void onAttached() {
+                    super.onAttached();
+                    updateText();
+                }
+
+                @Override
+                public void onTick() {
+                    super.onTick();
+                    updateText();
+                }
+
+                @Override
+                public void onActivate() {
+                    PlayerEditState state = stateSupplier.get();
+                    try {
+                        state.deleteTrack();
+                    } catch (ChangeCancelledException e) {
+                        getDisplay().playSound(SoundEffect.EXTINGUISH);
+                        state.clearEditedNodes();
+                    }
+                }
+
+                private void updateText() {
+                    PlayerEditState.TrackDeletionPlan plan = stateSupplier.get().createTrackDeletePlan();
+                    if (plan.isEmpty()) {
+                        this.setText("No Selection");
+                        this.setEnabled(false);
+                    } else if (plan.connectionsDeletedWithoutNodeDeletion == 0 || !plan.nodesToDelete.isEmpty()) {
+                        this.setText("Delete " + formatCount(plan.nodesToDelete.size(), "node"));
+                        this.setEnabled(true);
+                    } else if (plan.connectionsDeletedWithoutNodeDeletion == 1) {
+                        this.setText("Disconnect");
+                        this.setEnabled(true);
+                    } else {
+                        this.setText("Disconnect " + plan.connectionsDeletedWithoutNodeDeletion + "x");
+                        this.setEnabled(true);
+                    }
+                }
+
+                private String formatCount(int count, String singular) {
+                    if (count == 1) {
+                        return count + " " + singular;
+                    } else {
+                        return count + " " + singular + "s";
+                    }
+                }
+            }).setBounds(11, BASE_Y + 10, 96, 13);
+        }
+
+
+    }
+
+    private static void createPositionView(MapWidgetTabView.Tab tab, Supplier<PlayerEditState> stateSupplier) {
+        final int ADJ_BTN_WIDTH = 96;
+        final int ADJ_BTN_HEIGHT = 12;
+        final int OPTION_ROW_STEP = 16;
+
+        int y = 5;
+
+        // Switch between different shaper modes
+        {
+            tab.addWidget(new MapWidgetText())
+                .setText("Shape")
                 .setColor(MapColorPalette.COLOR_WHITE)
-                .setBounds(0, y + 1, 34, ADJ_BTN_HEIGHT);
+                .setBounds(43, y + 1, 40, ADJ_BTN_HEIGHT);
+            y += ADJ_BTN_HEIGHT;
+
+            tab.addWidget(new MapWidgetSelectionBox() {
+                @Override
+                public void onAttached() {
+                    super.onAttached();
+
+                    if (this.getItemCount() == 0) {
+                        for (PlayerEditShaperMode mode : PlayerEditShaperMode.values()) {
+                            this.addItem(mode.getDisplayName());
+                        }
+                    }
+                    this.setSelectedIndex(stateSupplier.get().getShaperMode().ordinal());
+
+                    // New TC API might not exist
+                    try {
+                        MapWidgetSelectionBox.class.getMethod("setLoopAround", boolean.class).invoke(this, true);
+                    } catch (Throwable t) { /* ignore */ }
+                }
+
+                @Override
+                public void onSelectedItemChanged() {
+                    PlayerEditShaperMode selectedMode = PlayerEditShaperMode.values()[this.getSelectedIndex()];
+                    stateSupplier.get().setShaperMode(selectedMode);
+                }
+            }).setBounds(10, y, ADJ_BTN_WIDTH, ADJ_BTN_HEIGHT);
+
+            y += OPTION_ROW_STEP;
+        }
+
+        // Options to increase or decrease the node count, or the even the spacing between the nodes
+        {
+            y += 4;
+
+            final int ROW_SPACING = 4;
+            final int FINE_COURSE_WIDTH = 18;
+            final int EVEN_WIDTH = ADJ_BTN_WIDTH - 2 * FINE_COURSE_WIDTH - 2 * ROW_SPACING;
+
+            tab.addWidget(new MapWidgetText())
+                .setText("Node Resolution")
+                .setColor(MapColorPalette.COLOR_WHITE)
+                .setBounds(20, y + 1, 74, ADJ_BTN_HEIGHT);
+            y += ADJ_BTN_HEIGHT;
 
             tab.addWidget(new MapWidgetButton() {
                 @Override
                 public void onActivate() {
-                    alignPosition(stateSupplier, axis, 0.0625);
+                    if (stateSupplier.get().performManipulation(NodeManipulator::makeCourser, NodeManipulator::equalizeNodeSpacing)) {
+                        getDisplay().playSound(SoundEffect.CLICK);
+                    } else {
+                        getDisplay().playSound(SoundEffect.EXTINGUISH);
+                    }
                 }
-            }).setText("Min").setBounds(38 + 0*ADJ_BTN_OFFSET, y, ADJ_BTN_WIDTH, ADJ_BTN_HEIGHT);
+            }).setText("-1")
+              .setBounds(10, y, FINE_COURSE_WIDTH, ADJ_BTN_HEIGHT);
 
             tab.addWidget(new MapWidgetButton() {
                 @Override
                 public void onActivate() {
-                    alignPosition(stateSupplier, axis, 0.5);
+                    if (stateSupplier.get().performManipulation(NodeManipulator::equalizeNodeSpacing)) {
+                        getDisplay().playSound(SoundEffect.CLICK);
+                    } else {
+                        getDisplay().playSound(SoundEffect.EXTINGUISH);
+                    }
                 }
-            }).setText("Mid").setBounds(38 + 1*ADJ_BTN_OFFSET, y, ADJ_BTN_WIDTH, ADJ_BTN_HEIGHT);
+            }).setText("Even")
+              .setBounds(10 + FINE_COURSE_WIDTH + ROW_SPACING, y, EVEN_WIDTH, ADJ_BTN_HEIGHT);
 
             tab.addWidget(new MapWidgetButton() {
-                @Override
-                public void onActivate() {
-                    alignPosition(stateSupplier, axis, 1.0 - 0.0625);
-                }
-            }).setText("Max").setBounds(38 + 2*ADJ_BTN_OFFSET, y, ADJ_BTN_WIDTH, ADJ_BTN_HEIGHT);
+                    @Override
+                    public void onActivate() {
+                        if (stateSupplier.get().performManipulation(NodeManipulator::makeFiner, NodeManipulator::equalizeNodeSpacing)) {
+                            getDisplay().playSound(SoundEffect.CLICK);
+                        } else {
+                            getDisplay().playSound(SoundEffect.EXTINGUISH);
+                        }
+                    }
+            }).setText("+1")
+              .setBounds(10 + FINE_COURSE_WIDTH + 2 * ROW_SPACING + EVEN_WIDTH , y, FINE_COURSE_WIDTH, ADJ_BTN_HEIGHT);
 
-            y += 16;
+            y += OPTION_ROW_STEP;
         }
 
         // Make the line straight or curved with simple buttons
         // Also done using /tcc straighten and /tcc curved
         {
-            y += 3; // Space between
+            y += 4;
 
             tab.addWidget(new MapWidgetText())
                 .setText("Connection Style")
@@ -209,9 +408,9 @@ public enum PlayerEditMode {
                         this.setText("No Selection");
                     }
                 }
-            }).setBounds(10, y, 96, ADJ_BTN_HEIGHT);
+            }).setBounds(10, y, ADJ_BTN_WIDTH, ADJ_BTN_HEIGHT);
 
-            y += 16;
+            y += OPTION_ROW_STEP;
         }
     }
 
@@ -526,12 +725,14 @@ public enum PlayerEditMode {
         final TypeSelectMenu typeSelector = new TypeSelectMenu(stateSupplier);
         tab.addWidget(typeSelector).setBounds(40, 0, 36, 36);
 
+        final int BUTTON_Y_STEP = 15;
+
         tab.addWidget(new MapWidgetButton() {
             @Override
             public void onActivate() {
                 typeSelector.getSelectedType().openPositionMenu(tab, stateSupplier);
             }
-        }).setText("Position").setBounds(26, 40, 64, 13);
+        }).setText("Position").setBounds(26, 40 + 0 * BUTTON_Y_STEP, 64, 13);
 
         tab.addWidget(new MapWidgetButton() {
             @Override
@@ -546,7 +747,10 @@ public enum PlayerEditMode {
                     getDisplay().playSound(SoundEffect.EXTINGUISH);
                 }
             }
-        }).setText("Flip").setBounds(26, 55, 64, 13);
+        }).setText("Flip").setBounds(26, 40 + 1 * BUTTON_Y_STEP, 64, 13);
+
+        tab.addWidget(new ItemLODSelectButton(stateSupplier)).setText("LOD")
+                .setBounds(26, 40 + 2 * BUTTON_Y_STEP, 64, 13);
 
         tab.addWidget(new MapWidgetButton() {
             @Override
@@ -561,6 +765,6 @@ public enum PlayerEditMode {
                     getDisplay().playSound(SoundEffect.EXTINGUISH);
                 }
             }
-        }).setText("Delete").setBounds(26, 70, 64, 13);
+        }).setText("Delete").setBounds(26, 40 + 3 * BUTTON_Y_STEP, 64, 13);
     }
 }

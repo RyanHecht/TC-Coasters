@@ -4,6 +4,8 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.bergerkiller.bukkit.coasters.commands.parsers.QuotedLinesParser;
+import com.bergerkiller.bukkit.coasters.editor.PlayerEditClipboard;
 import org.bukkit.ChatColor;
 import org.bukkit.block.BlockFace;
 import org.bukkit.command.CommandSender;
@@ -15,21 +17,106 @@ import com.bergerkiller.bukkit.coasters.commands.annotations.CommandRequiresTCCP
 import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
 import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
 import com.bergerkiller.bukkit.coasters.signs.power.NamedPowerChannel;
-import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSign;
 import com.bergerkiller.bukkit.common.block.SignEditDialog;
 
-import cloud.commandframework.annotations.Argument;
-import cloud.commandframework.annotations.CommandDescription;
-import cloud.commandframework.annotations.CommandMethod;
-import cloud.commandframework.annotations.Flag;
+import org.incendo.cloud.annotation.specifier.Greedy;
+import org.incendo.cloud.annotations.Argument;
+import org.incendo.cloud.annotations.CommandDescription;
+import org.incendo.cloud.annotations.Command;
+import org.incendo.cloud.annotations.Flag;
 
-@CommandMethod("tccoasters|tcc sign|signs")
+@Command("tccoasters|tcc sign|signs")
 class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("add")
+    @Command("copy")
+    @CommandDescription("Copies the signs of all selected nodes to the clipboard")
+    public void commandCopy(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final @Flag("all") boolean copyAllSigns
+    ) {
+        if (copyAllSigns) {
+            state.getClipboard().copySigns();
+        } else {
+            state.getClipboard().copySelectedSign();
+        }
+        if (state.getClipboard().isSignsFilled()) {
+            if (copyAllSigns) {
+                sender.sendMessage(state.getClipboard().getSignCount() + " signs copied to the clipboard!");
+            } else {
+                sender.sendMessage("Selected sign is copied to the clipboard!");
+            }
+        } else {
+            sender.sendMessage("No nodes with signs selected, clipboard cleared!");
+        }
+    }
+
+    @CommandRequiresTCCPermission
+    @CommandRequiresSelectedNodes
+    @Command("cut")
+    @CommandDescription("Copies all currently selected nodes to the clipboard and deletes them")
+    public void commandCut(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final @Flag("all") boolean cutAllSigns
+    ) {
+        // Copy selected sign or all signs of selected nodes
+        if (cutAllSigns) {
+            state.getClipboard().copySigns();
+        } else {
+            state.getClipboard().copySelectedSign();
+        }
+
+        if (state.getClipboard().isSignsFilled()) {
+            try {
+                // Remove what we copied
+                if (cutAllSigns) {
+                    state.getSigns().clearSigns();
+                } else {
+                    state.getSigns().removeLastSign();
+                }
+                if (!cutAllSigns && state.getClipboard().getSignCount() == 1) {
+                    sender.sendMessage("Selected sign is cut from the node and copied to the clipboard!");
+                } else {
+                    sender.sendMessage(state.getClipboard().getSignCount() + " signs cut from the selected nodes and saved to the clipboard!");
+                }
+            } catch (ChangeCancelledException e) {
+                sender.sendMessage(ChatColor.RED + "Some signs could not be removed from the selected nodes!");
+            }
+        } else {
+            sender.sendMessage("No nodes with signs selected, clipboard cleared!");
+        }
+    }
+
+    @CommandRequiresTCCPermission
+    @CommandRequiresSelectedNodes
+    @Command("paste")
+    @CommandDescription("Pastes the current sign contents of the clipboard onto the selected nodes")
+    public void commandPaste(
+            final PlayerEditState state,
+            final CommandSender sender,
+            final @Flag("replace") boolean replaceExistingSigns
+    ) {
+        final PlayerEditClipboard clipboard = state.getClipboard();
+
+        if (!clipboard.isSignsFilled()) {
+            sender.sendMessage("Sign clipboard is empty, nothing has been pasted!");
+            return;
+        }
+
+        try {
+            clipboard.pasteSigns(replaceExistingSigns);
+        } catch (ChangeCancelledException e) {
+            sender.sendMessage(ChatColor.RED + "The signs could not be pasted here");
+        }
+    }
+
+    @CommandRequiresTCCPermission
+    @CommandRequiresSelectedNodes
+    @Command("add")
     @CommandDescription("Shows a sign dialog and puts the inputed text as a sign to the currently selected nodes")
     public void commandAddWithDialog(
             final PlayerEditState state,
@@ -38,26 +125,34 @@ class EditStateSignCommands {
         new SignEditDialog() {
             @Override
             public void onClosed(Player player, String[] lines) {
-                commandAddWithLines(state, player, lines);
+                handleCommandAddWithLines(state, player, QuotedLinesParser.create().addLines(lines));
             }
         }.open(sender);
     }
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("add <lines>")
+    @Command("add <lines>")
     @CommandDescription("Adds a new sign to the currently selected nodes")
     public void commandAddWithLines(
             final PlayerEditState state,
             final Player sender,
-            final @Argument("lines") String[] lines
+            final @Greedy @Argument("lines") String linesText
     ) {
-        if (lines == null || lines.length == 0) {
+        handleCommandAddWithLines(state, sender, QuotedLinesParser.create().parse(linesText));
+    }
+
+    public void handleCommandAddWithLines(
+            final PlayerEditState state,
+            final Player sender,
+            final QuotedLinesParser lines
+    ) {
+        if (!lines.hasLines()) {
             commandAddWithDialog(state, sender);
             return;
         }
 
-        TrackNodeSign sign = new TrackNodeSign(lines);
+        TrackNodeSign sign = new TrackNodeSign(lines.getLinesArray());
         try {
             state.getSigns().addSign(sign);
             TCCoastersLocalization.SIGN_ADD_MANY_SUCCESS.message(sender);
@@ -68,41 +163,48 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("edit")
+    @Command("edit")
     @CommandDescription("Shows a sign dialog and replaces the sign text with the inputed text for all signs of the currently selected nodes")
     public void commandEditWithDialog(
             final PlayerEditState state,
             final Player sender
     ) {
-        final TrackNodeSign toEdit = findSignToEdit(state);
-        if (toEdit != null) {
-            new SignEditDialog() {
-                @Override
-                public void onClosed(Player player, String[] lines) {
-                    commandEditWithLines(state, player, toEdit, lines);
-                }
-            }.open(sender, toEdit.getLines());
+        final TrackNodeSign toEdit = state.getSigns().getEditedSign();
+        if (toEdit == null) {
+            TCCoastersLocalization.SIGN_MISSING.message(state.getPlayer());
+            return;
         }
+
+        new SignEditDialog() {
+            @Override
+            public void onClosed(Player player, String[] lines) {
+                commandEditWithLines(state, player, toEdit, lines);
+            }
+        }.open(sender, toEdit.getLines());
     }
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("edit <lines>")
+    @Command("edit <lines>")
     @CommandDescription("Adds a new sign to the currently selected nodes")
     public void commandEditWithLines(
             final PlayerEditState state,
             final Player sender,
-            final @Argument("lines") String[] lines
+            final @Greedy @Argument("lines") String linesText
     ) {
-        if (lines == null || lines.length == 0) {
+        QuotedLinesParser parser = QuotedLinesParser.create().parse(linesText);
+        if (!parser.hasLines()) {
             commandEditWithDialog(state, sender);
             return;
         }
 
-        TrackNodeSign toEdit = findSignToEdit(state);
-        if (toEdit != null) {
-            commandEditWithLines(state, sender, toEdit, lines);
+        TrackNodeSign toEdit = state.getSigns().getEditedSign();
+        if (toEdit == null) {
+            TCCoastersLocalization.SIGN_MISSING.message(state.getPlayer());
+            return;
         }
+
+        commandEditWithLines(state, sender, toEdit, parser.getLinesArray());
     }
 
     private void commandEditWithLines(
@@ -117,7 +219,7 @@ class EditStateSignCommands {
             return;
         }
         try {
-            if (state.getSigns().replaceSign(toReplace, sign)) {
+            if (state.getSigns().replaceSignText(toReplace, sign)) {
                 TCCoastersLocalization.SIGN_ADD_MANY_SUCCESS.message(sender);
             } else {
                 TCCoastersLocalization.SIGN_EDIT_MANY_NOTEXIST.message(sender);
@@ -127,26 +229,9 @@ class EditStateSignCommands {
         }
     }
 
-    private static TrackNodeSign findSignToEdit(PlayerEditState state) {
-        TrackNode lastEdited = state.getLastEditedNode();
-        TrackNodeSign[] signs;
-        if (lastEdited != null && (signs = lastEdited.getSigns()).length > 0) {
-            return signs[signs.length - 1];
-        }
-
-        for (TrackNode node : state.getEditedNodes()) {
-            if ((signs = node.getSigns()).length > 0) {
-                return signs[signs.length - 1];
-            }
-        }
-
-        TCCoastersLocalization.SIGN_MISSING.message(state.getPlayer());
-        return null;
-    }
-
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("remove")
+    @Command("remove")
     @CommandDescription("Removes the last-added sign from all selected nodes")
     public void commandRemove(
             final PlayerEditState state,
@@ -165,7 +250,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("clear")
+    @Command("clear")
     @CommandDescription("Clears all signs set for the currently selected nodes")
     public void commandClear(
             final PlayerEditState state,
@@ -181,7 +266,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("scroll|next")
+    @Command("scroll|next")
     @CommandDescription("Scrolls all signs one down, so a different sign can be edited")
     public void commandScroll(
             final PlayerEditState state,
@@ -197,7 +282,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("power add <channel>")
+    @Command("power add <channel>")
     @CommandDescription("Assigns a power channel to the last-added sign of the selected nodes")
     public void commandAddInputPowerChannel(
             final PlayerEditState state,
@@ -235,7 +320,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("power remove <channel>")
+    @Command("power remove <channel>")
     @CommandDescription("Removes a power channel from the last-added sign of the selected nodes")
     public void commandRemoveInputPowerChannel(
             final PlayerEditState state,
@@ -275,7 +360,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("power clear")
+    @Command("power clear")
     @CommandDescription("Clears all power channels from last-added sign of the selected nodes")
     public void commandClearInputPowerChannels(
             final PlayerEditState state,
@@ -293,7 +378,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("power rotate")
+    @Command("power rotate")
     @CommandDescription("Rotates all power channels from last-added sign of the selected nodes by 90 degrees")
     public void commandRotateInputPowerChannels(
             final PlayerEditState state,
@@ -322,7 +407,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("power rotate <channel>")
+    @Command("power rotate <channel>")
     @CommandDescription("Rotates a power channel from last-added sign of the selected nodes by 90 degrees")
     public void commandRotateInputNamedPowerChannels(
             final PlayerEditState state,
@@ -352,7 +437,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("output add <channel>")
+    @Command("output add <channel>")
     @CommandDescription("Assigns a power output channel to the last-added sign of the selected nodes")
     public void commandAddOutputPowerChannel(
             final PlayerEditState state,
@@ -388,7 +473,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("output remove <channel>")
+    @Command("output remove <channel>")
     @CommandDescription("Removes a power output channel from the last-added sign of the selected nodes")
     public void commandRemoveOutputPowerChannel(
             final PlayerEditState state,
@@ -420,7 +505,7 @@ class EditStateSignCommands {
 
     @CommandRequiresTCCPermission
     @CommandRequiresSelectedNodes
-    @CommandMethod("output clear")
+    @Command("output clear")
     @CommandDescription("Clears all power output channels from last-added sign of the selected nodes")
     public void commandClearOutputPowerChannels(
             final PlayerEditState state,

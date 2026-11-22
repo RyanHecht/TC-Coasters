@@ -16,6 +16,7 @@ import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
+import com.bergerkiller.bukkit.common.Common;
 import org.bukkit.entity.Player;
 import org.bukkit.util.Vector;
 
@@ -50,6 +51,8 @@ import com.bergerkiller.bukkit.common.utils.CommonUtil;
 import com.bergerkiller.bukkit.common.utils.PlayerUtil;
 
 public class ObjectEditState {
+    private static final boolean YAML_HAS_LIST_IN_LIST_BUG = !Common.hasCapability("Common:Yaml:ListOfListFix");
+
     private final PlayerEditState editState;
     private final Map<TrackObject, ObjectEditTrackObject> editedTrackObjects = new LinkedHashMap<TrackObject, ObjectEditTrackObject>();
     private final List<DuplicatedObject> duplicatedObjects = new ArrayList<DuplicatedObject>();
@@ -81,17 +84,36 @@ public class ObjectEditState {
      * Sets the selected track object type information to a new value.
      * Refreshes all selected track objects to use this new type.
      * New objects placed will have this same type.
-     * 
+     *
      * @param type
      */
     public void setSelectedType(TrackObjectType<?> type) {
+        setSelectedType(type, false);
+    }
+
+    /**
+     * Sets the selected track object type information to a new value.
+     * Refreshes all selected track objects to use this new type.
+     * New objects placed will have this same type.
+     * 
+     * @param type
+     * @param silent When silent, the type is not applied to the track objects.
+     *               It only updates the UI showing the track object that is
+     *               selected. Primarily internal use only.
+     */
+    public void setSelectedType(TrackObjectType<?> type, boolean silent) {
         if (type == null) {
             throw new IllegalArgumentException("Type can not be null");
         }
         this.selectedType = type;
         this.editState.markChanged();
 
+        if (silent) {
+            return;
+        }
+
         Iterator<ObjectEditTrackObject> iter = this.editedTrackObjects.values().iterator();
+        Set<TrackConnection> updatedConnections = new HashSet<>();
         while (iter.hasNext()) {
             ObjectEditTrackObject editObject = iter.next();
             if (CommonUtil.callEvent(new CoasterBeforeChangeTrackObjectEvent(getPlayer(), editObject.connection, editObject.object)).isCancelled()) {
@@ -104,7 +126,9 @@ public class ObjectEditState {
                 continue;
             }
             editObject.object.setType(editObject.connection, type);
+            updatedConnections.add(editObject.connection);
         }
+        updatedConnections.forEach(c -> c.saveObjectsToAnimationStates(this.editState.getSelectedAnimation()));
     }
 
     /**
@@ -177,13 +201,33 @@ public class ObjectEditState {
         // Make use of the CSV format to save the selected track object type information
         TrackCSV.TrackObjectTypeEntry<?> entry = TrackCSV.createTrackObjectTypeEntry("SELECTED", this.selectedType);
         if (entry != null) {
-            StringArrayBuffer buffer = new StringArrayBuffer();
-            entry.write(buffer);
-            config.set("selectedTrackObject", Arrays.asList(buffer.toArray()));
+            List<? extends TrackCSV.CSVEntry> extraEntries = entry.getExtraCSVEntries();
+            if (!extraEntries.isEmpty()) {
+                List<ConfigurationNode> extraConfigs = config.getNodeList("selectedTrackObjectExtra", false);
+                for (TrackCSV.CSVEntry extraEntry : extraEntries) {
+                    ConfigurationNode extraConfig = new ConfigurationNode();
+                    if (YAML_HAS_LIST_IN_LIST_BUG) {
+                        extraConfig.set("unused", 0); // Workaround for BKCommonLib Yaml bug
+                    }
+                    writeCSVEntryToYaml(extraConfig, "data", extraEntry);
+                    extraConfigs.add(extraConfig);
+                }
+            } else {
+                config.remove("selectedTrackObjectExtra");
+            }
+
+            writeCSVEntryToYaml(config, "selectedTrackObject", entry);
         } else {
             config.remove("selectedTrackObject");
+            config.remove("selectedTrackObjectExtra");
         }
         config.set("dragControl", this.isDragControlEnabled);
+    }
+
+    private static void writeCSVEntryToYaml(ConfigurationNode config, String key, TrackCSV.CSVEntry entry) {
+        StringArrayBuffer buffer = new StringArrayBuffer();
+        entry.write(buffer);
+        config.set(key, Arrays.asList(buffer.toArray()));
     }
 
     /**
@@ -219,6 +263,18 @@ public class ObjectEditState {
 
     public boolean hasEditedObjects() {
         return !this.editedTrackObjects.isEmpty();
+    }
+
+    /**
+     * Gets the last edited group of track objects. If a player clicks on an object
+     * that is occupying the same space as several other track objects, a group is made.
+     * This group can then be cycled through. This property gives information about
+     * this cycling operation.
+     *
+     * @return ObjectEditSelectedGroup, or null if no group is selected
+     */
+    public ObjectEditSelectedGroup getLastEditedGroup() {
+        return lastEditedGroup;
     }
 
     public void clearEditedTrackObjects() {
@@ -303,6 +359,18 @@ public class ObjectEditState {
                     // Set a flag that we are about to start duplicating mode
                     // Once the player moves the cursor away, actual duplicating starts
                     this.isPreDuplicating = true;
+
+                    // If all track objects occupy the exact same position, and are the same track object,
+                    // instead of duplicating just select one of them and continue dragging that.
+                    // Likely a previous dupe wasn't moved away by the player.
+                    if (DuplicationSourceList.isMultipleSameTrackObject(this.editedTrackObjects.values())) {
+                        this.isPreDuplicating = false;
+                        ObjectEditTrackObject firstObject = this.editedTrackObjects.values().iterator().next();
+                        this.clearEditedTrackObjects();
+                        this.selectTrackObject(firstObject.connection, firstObject.object);
+                        this.undoDuplicatedObjects();
+                        this.startDrag(point, false);
+                    }
                 }
             }
             return true;
@@ -556,6 +624,14 @@ public class ObjectEditState {
 
             // May have caused a particle visibility change
             getWorld().getParticles().scheduleViewerUpdate(this.getPlayer());
+
+            // Refresh UI
+            {
+                TrackObject singleSelection = group.getSingleSelection();
+                if (singleSelection != null) {
+                    setSelectedType(singleSelection.getType(), true);
+                }
+            }
         }
     }
 
@@ -1261,26 +1337,55 @@ public class ObjectEditState {
 
     /// Makes use of the CSV format to load the selected track object type information
     private TrackObjectType<?> parseType(ConfigurationNode config) {
-        if (config.contains("selectedTrackObject")) {
-            List<String> values = config.getList("selectedTrackObject", String.class);
-            if (values != null && !values.isEmpty()) {
-                StringArrayBuffer buffer = new StringArrayBuffer();
-                buffer.load(values);
-                try {
-                    TrackCSV.CSVEntry entry = TrackCSV.decode(buffer);
-                    if (entry instanceof TrackCSV.TrackObjectTypeEntry) {
-                        TrackCSV.TrackObjectTypeEntry<?> typeEntry = (TrackCSV.TrackObjectTypeEntry<?>) entry;
-                        if (typeEntry.objectType != null) {
-                            return typeEntry.objectType;
+        try {
+            TrackCSV.CSVEntry entry = readEntryFromConfig(config, "selectedTrackObject");
+            if (entry instanceof TrackCSV.TrackObjectTypeEntry) {
+                // If there are 'extra' csv entries, parse those too and pass them to the
+                // entry being decoded using the reader state.
+                // This is to preserve item LODs
+                if (config.contains("selectedTrackObjectExtra")) {
+                    List<ConfigurationNode> extraConfigs = config.getNodeList("selectedTrackObjectExtra");
+                    if (extraConfigs != null && !extraConfigs.isEmpty()) {
+                        TrackCSV.CSVReaderState readerState = new TrackCSV.CSVReaderState();
+
+                        for (ConfigurationNode extraConfig : extraConfigs) {
+                            TrackCSV.CSVEntry extraEntry = readEntryFromConfig(extraConfig, "data");
+                            if (extraEntry != null) {
+                                extraEntry.processReader(readerState);
+                            }
                         }
+
+                        entry.processReader(readerState);
+                        entry.processReaderEnd(readerState);
                     }
-                } catch (SyntaxException e) {
-                    this.editState.getPlugin().getLogger().log(Level.WARNING, "Failed to load track object type for " +
-                            this.getPlayer().getName(), e);
+                }
+
+                TrackCSV.TrackObjectTypeEntry<?> typeEntry = (TrackCSV.TrackObjectTypeEntry<?>) entry;
+                if (typeEntry.objectType != null) {
+                    return typeEntry.objectType;
                 }
             }
+        } catch (SyntaxException | ChangeCancelledException e) {
+            this.editState.getPlugin().getLogger().log(Level.WARNING, "Failed to load track object type for " +
+                    this.getPlayer().getName(), e);
         }
+
         return TrackObjectTypeArmorStandItem.createDefault();
+    }
+
+    private static TrackCSV.CSVEntry readEntryFromConfig(ConfigurationNode config, String key) throws SyntaxException {
+        if (!config.contains(key)) {
+            return null;
+        }
+
+        List<String> values = config.getList(key, String.class);
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+
+        StringArrayBuffer buffer = new StringArrayBuffer();
+        buffer.load(values);
+        return TrackCSV.decode(buffer);
     }
 
     private Collection<ObjectEditTrackObject> computeDraggedObjects(boolean initialDirection) {

@@ -17,11 +17,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 
-import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSign;
+import com.bergerkiller.bukkit.coasters.editor.PlayerRegionViewRange;
+import com.bergerkiller.bukkit.coasters.editor.TCCoastersDisplay;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeSignLookup;
-import com.bergerkiller.bukkit.tc.events.SignBuildEvent;
-import com.bergerkiller.bukkit.tc.events.SignChangeActionEvent;
-import com.bergerkiller.bukkit.tc.rails.RailLookup;
+import com.bergerkiller.bukkit.common.bases.IntVector3;
+import com.bergerkiller.bukkit.common.map.MapDisplay;
+import com.bergerkiller.bukkit.tc.rails.WorldRailLookup;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.command.CommandSender;
@@ -75,7 +76,6 @@ public class TCCoasters extends PluginBase {
     private final List<SignAction> registeredSignActions = Arrays.asList(
             powerSignAction, new SignActionTrackAnimate());
     private final Hastebin hastebin = new Hastebin(this);
-    private final TrackNodeSign.SignBuildHandler signBuildHandler = detectSignBuildHandler();
     private final TrackNodeSignLookup signLookup = new TrackNodeSignLookup();
     private final TCCoastersListener listener = new TCCoastersListener(this);
     private final TCCoastersInteractionListener interactionListener = new TCCoastersInteractionListener(this);
@@ -85,6 +85,7 @@ public class TCCoasters extends PluginBase {
     private double smoothness = DEFAULT_SMOOTHNESS;
     private boolean glowingSelections = DEFAULT_GLOWING_SELECTIONS;
     private int particleViewRange = DEFAULT_PARTICLE_VIEW_RANGE;
+    private int maximumParticleViewRange = DEFAULT_PARTICLE_VIEW_RANGE;
     private int maximumParticleCount = DEFAULT_MAXIMUM_PARTICLE_COUNT;
     private boolean maximumParticleWarning = DEFAULT_MAXIMUM_PARTICLE_WARNING;
     private boolean plotSquaredEnabled = DEFAULT_PLOTSQUARED_ENABLED;
@@ -204,6 +205,11 @@ public class TCCoasters extends PluginBase {
             state.save();
             editStates.remove(player);
         }
+
+        // Ensure particle state is reset, otherwise when player rejoins the player can't
+        // see particles spawn in anymore
+        CoasterWorld world = this.getCoasterWorld(player.getWorld());
+        world.getParticles().hideAllFor(player);
     }
 
     public FileConfiguration getPlayerConfig(Player player) {
@@ -365,13 +371,24 @@ public class TCCoasters extends PluginBase {
     }
 
     /**
-     * Gets the particle view range. Players can see particles when
-     * below this distance away from a particle.
+     * Gets the default particle view range. Players can see particles when
+     * below this distance away from a particle. Players can set a different
+     * view range for themselves too, so this is a default/initial value.
      * 
      * @return particle view range
      */
     public int getParticleViewRange() {
         return this.particleViewRange;
+    }
+
+    /**
+     * Gets the maximum particle view range players can set for themselves.
+     *
+     * @return maximum particle view range
+     * @see #getParticleViewRange()
+     */
+    public int getMaximumParticleViewRange() {
+        return this.maximumParticleViewRange;
     }
 
     /**
@@ -403,16 +420,6 @@ public class TCCoasters extends PluginBase {
         return this.exportFolder;
     }
 
-    /**
-     * Gets the Sign Building handler that is appropriate for the current version of TrainCarts
-     * run on the server. This handler handles build permissions for new signs
-     *
-     * @return Build handler
-     */
-    public TrackNodeSign.SignBuildHandler getSignBuildHandler() {
-        return signBuildHandler;
-    }
-
     @Override
     public void onLoad() {
         // Load configuration
@@ -434,9 +441,12 @@ public class TCCoasters extends PluginBase {
         config.setHeader("hastebinServer", "\nThe hastebin server which is used to upload coaster tracks");
         config.addHeader("hastebinServer", "This will be used when using the /tcc export command");
         this.hastebin.setServer(config.get("hastebinServer", "https://paste.traincarts.net"));
-        config.setHeader("particleViewRange", "\nMaximum block distance away from particles where players can see them");
+        config.setHeader("particleViewRange", "\nMaximum block distance away from particles where players can see them by default");
         config.addHeader("particleViewRange", "Lowering this range may help reduce lag in the client if a lot of particles are displayed");
+        config.addHeader("particleViewRange", "Players can change this default value for themselves using /tcc option particleviewrange");
         this.particleViewRange = config.get("particleViewRange", DEFAULT_PARTICLE_VIEW_RANGE);
+        config.setHeader("maximumParticleViewRange", "\nMaximum value for particleViewRange players can set using /tcc option particleviewrange");
+        this.maximumParticleViewRange = config.get("maximumParticleViewRange", this.particleViewRange);
         config.setHeader("maximumParticleCount", "\nMaximum number of particles that can be visible to a player at one time");
         config.addHeader("maximumParticleCount", "When more particles are visible than this, the player sees a warning, and some particles are hidden");
         config.addHeader("maximumParticleCount", "This can be used to prevent a total lag-out of the client when accidentally creating a lot of track");
@@ -477,10 +487,31 @@ public class TCCoasters extends PluginBase {
                 this.updateDependency(plugin, plugin.getName(), true);
             }
         }
+
+        // When API is supported, make the tcc-max-view available
+        if (Common.hasCapability("Module:RegionFlagTracker")) {
+            enableTCCMaxViewRegionFlagTracker();
+        }
+    }
+
+    private void enableTCCMaxViewRegionFlagTracker() {
+        PlayerRegionViewRange.register(this);
     }
 
     @Override
     public void enable() {
+        // Check before enabling
+        if (!Common.hasCapability("Common:MapDisplay:CustomItemType")) {
+            throw new RuntimeException("BKCommonLib is too old! Please update BKCommonLib!");
+        }
+
+        // Annoying little hack, this is the best way to avoid complete horrible breakage for people...
+        try {
+            WorldRailLookup.class.getMethod("redetectRailsAtBlock", IntVector3.class);
+        } catch (NoSuchMethodException ex) {
+            throw new RuntimeException("TrainCarts is too old! Please update to the latest version.");
+        }
+
         this.listener.enable();
         this.interactionListener.enable();
 
@@ -558,6 +589,36 @@ public class TCCoasters extends PluginBase {
             isDisabled = true;
             worlds.clear();
             editStates.clear();
+        }
+    }
+
+    /**
+     * Performs a soft reload: saves all data to disk, de-initializes partially and re-initializes
+     * from disk.
+     */
+    public void reload() {
+        // First, log out all players to guarantee their state is saved and then reset
+        for (Player player : getPlayersWithEditStates()) {
+            logoutPlayer(player);
+        }
+
+        // Unload all coasters, saving coasters that have open changes first
+        // The load command should only be used to load new coasters / reload existing ones
+        for (World world : Bukkit.getWorlds()) {
+            unloadWorld(world);
+        }
+
+        // Reload all coasters, getCoasterWorld() will automatically load them
+        for (World world : Bukkit.getWorlds()) {
+            getCoasterWorld(world);
+        }
+
+        // Ensure that tcc-power signs hook back up to their named power channel again
+        powerSignAction.reloadAllRecipients();
+
+        // For all players holding the editor map, reload it
+        for (TCCoastersDisplay display : MapDisplay.getAllDisplays(TCCoastersDisplay.class)) {
+            display.restartDisplay();
         }
     }
 
@@ -715,41 +776,6 @@ public class TCCoasters extends PluginBase {
         return this.hastebin.download(fileOrURL);
     }
 
-    private static TrackNodeSign.SignBuildHandler detectSignBuildHandler() {
-        boolean hasSignBuildEvent;
-        try {
-            SignBuildEvent.class.getConstructor(Player.class, RailLookup.TrackedSign.class, boolean.class);
-            hasSignBuildEvent = true;
-        } catch (Throwable t) {
-            hasSignBuildEvent = false;
-        }
-        return hasSignBuildEvent ? createModernSignBuildHandler() : createLegacySignBuildHandler();
-    }
-
-    private static TrackNodeSign.SignBuildHandler createModernSignBuildHandler() {
-        return (player, trackedSign, interactive) -> {
-            SignBuildEvent event = new SignBuildEvent(player, trackedSign, interactive);
-            SignAction.handleBuild(event);
-            return !event.isCancelled();
-        };
-    }
-
-    @SuppressWarnings("deprecation")
-    private static TrackNodeSign.SignBuildHandler createLegacySignBuildHandler() {
-        return (player, trackedSign, interactive) -> {
-            // Non-interactive building with only permission checking didn't exist here
-            // TODO: We do want to fire the loadedChanged() at least maybe? In legacy times
-            //       it already didn't fire this event (bug?) so it's whatever I guess.
-            if (!interactive) {
-                return true;
-            }
-
-            SignChangeActionEvent event = new SignChangeActionEvent(player, trackedSign);
-            SignAction.handleBuild(event);
-            return !event.isCancelled();
-        };
-    }
-
     private static class AutosaveTask extends Task {
 
         public AutosaveTask(JavaPlugin plugin) {
@@ -768,7 +794,7 @@ public class TCCoasters extends PluginBase {
                 while (iter.hasNext()) {
                     PlayerEditState state = iter.next();
                     state.save();
-                    if (!state.getPlayer().isOnline()) {
+                    if (!TCCoastersUtil.isPlayerConnected(state.getPlayer())) {
                         iter.remove();
                     }
                 }
@@ -852,10 +878,10 @@ public class TCCoasters extends PluginBase {
                 Iterator<PlayerEditState> iter = editStates.values().iterator();
                 while (iter.hasNext()) {
                     PlayerEditState state = iter.next();
-                    if (!state.getPlayer().isOnline()) {
-                        iter.remove();
-                    } else {
+                    if (TCCoastersUtil.isPlayerConnected(state.getPlayer())) {
                         state.update();
+                    } else {
+                        iter.remove();
                     }
                 }
             }

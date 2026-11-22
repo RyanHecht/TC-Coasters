@@ -14,12 +14,12 @@ import com.bergerkiller.bukkit.common.utils.EntityUtil;
 import com.bergerkiller.bukkit.common.utils.PacketUtil;
 import com.bergerkiller.bukkit.common.wrappers.ChatText;
 import com.bergerkiller.bukkit.common.wrappers.DataWatcher;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityDestroyHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityMetadataHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutEntityTeleportHandle;
-import com.bergerkiller.generated.net.minecraft.network.protocol.game.PacketPlayOutSpawnEntityLivingHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundSetEntityDataPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacketHandle;
+import com.bergerkiller.generated.net.minecraft.network.protocol.game.ClientboundAddMobPacketHandle;
 import com.bergerkiller.generated.net.minecraft.world.entity.EntityHandle;
-import com.bergerkiller.generated.net.minecraft.world.entity.decoration.EntityArmorStandHandle;
+import com.bergerkiller.generated.net.minecraft.world.entity.decoration.ArmorStandHandle;
 
 /**
  * A particle consisting of a text balloon that always faces the viewer,
@@ -91,21 +91,13 @@ public class TrackParticleSignText extends TrackParticle {
             }
         }
 
-        // De-spawn the original armorstands
-        for (Player player : this.getViewers()) {
-            this.makeHiddenFor(player);
-        }
-
         // Update the lines. Re-use entity id's if we can.
         for (int i = 0; i < new_lines.length; i++) {
             new_lines[i].entityId = (i < old_lines.length) ? old_lines[i].entityId : EntityUtil.getUniqueEntityId();
         }
-        this.lines = new_lines;
 
-        // Make the new lines visible again
-        for (Player player : this.getViewers()) {
-            this.makeVisibleFor(player);
-        }
+        // De-spawn the signs, update the lines, then show the signs again
+        this.getWorld().hideAndDisplayParticle(this, p -> p.lines = new_lines);
     }
 
     @Override
@@ -122,7 +114,7 @@ public class TrackParticleSignText extends TrackParticle {
 
             // Spawns an invisible armorstand, which displays only the nametag
             yOffset += half_offset;
-            PacketPlayOutSpawnEntityLivingHandle spawnPacket = PacketPlayOutSpawnEntityLivingHandle.T.newHandleNull();
+            ClientboundAddMobPacketHandle spawnPacket = ClientboundAddMobPacketHandle.createNew();
             spawnPacket.setEntityId(line.entityId);
             spawnPacket.setEntityUUID(UUID.randomUUID());
             spawnPacket.setEntityType(EntityType.ARMOR_STAND);
@@ -141,15 +133,15 @@ public class TrackParticleSignText extends TrackParticle {
 
     @Override
     public void makeHiddenFor(Player viewer) {
-        if (PacketPlayOutEntityDestroyHandle.canDestroyMultiple()) {
+        if (ClientboundRemoveEntitiesPacketHandle.canDestroyMultiple()) {
             int[] ids = new int[this.lines.length];
             for (int i = 0; i < ids.length; i++) {
                 ids[i] = this.lines[i].entityId;
             }
-            PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewMultiple(ids));
+            PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewMultiple(ids));
         } else {
             for (TextLine line : this.lines) {
-                PacketUtil.sendPacket(viewer, PacketPlayOutEntityDestroyHandle.createNewSingle(line.entityId));
+                PacketUtil.sendPacket(viewer, ClientboundRemoveEntitiesPacketHandle.createNewSingle(line.entityId));
             }
         }
     }
@@ -163,7 +155,7 @@ public class TrackParticleSignText extends TrackParticle {
                 double half_offset = 0.5 * line.getOffset();
 
                 yOffset += half_offset;
-                PacketPlayOutEntityTeleportHandle tpPacket = PacketPlayOutEntityTeleportHandle.createNew(
+                ClientboundEntityPositionSyncPacketHandle tpPacket = ClientboundEntityPositionSyncPacketHandle.createNew(
                         line.entityId,
                         this.position.getX() + ARMORSTAND_OFFSET.getX(),
                         this.position.getY() + ARMORSTAND_OFFSET.getY() + yOffset,
@@ -202,8 +194,8 @@ public class TrackParticleSignText extends TrackParticle {
                 meta.set(EntityHandle.DATA_CUSTOM_NAME_VISIBLE, true);
                 meta.set(EntityHandle.DATA_CUSTOM_NAME, buildText());
                 meta.set(EntityHandle.DATA_FLAGS, (byte) (EntityHandle.DATA_FLAG_INVISIBLE | EntityHandle.DATA_FLAG_ON_FIRE));
-                meta.set(EntityArmorStandHandle.DATA_ARMORSTAND_FLAGS, (byte) (EntityArmorStandHandle.DATA_FLAG_SET_MARKER
-                        | EntityArmorStandHandle.DATA_FLAG_NO_BASEPLATE | EntityArmorStandHandle.DATA_FLAG_IS_SMALL));
+                meta.set(ArmorStandHandle.DATA_ARMORSTAND_FLAGS, (byte) (ArmorStandHandle.DATA_FLAG_SET_MARKER
+                        | ArmorStandHandle.DATA_FLAG_NO_BASEPLATE | ArmorStandHandle.DATA_FLAG_IS_SMALL));
                 this.metadata = meta;
             }
             return meta;
@@ -213,7 +205,7 @@ public class TrackParticleSignText extends TrackParticle {
             DataWatcher meta = this.metadata;
             if (meta != null) {
                 meta.set(EntityHandle.DATA_CUSTOM_NAME, buildText());
-                particle.broadcastPacket(PacketPlayOutEntityMetadataHandle.createNew(this.entityId, meta, false));
+                particle.broadcastPacket(ClientboundSetEntityDataPacketHandle.createNew(this.entityId, meta, false));
             }
         }
 

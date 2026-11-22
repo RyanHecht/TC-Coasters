@@ -17,7 +17,7 @@ import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
  *
  * Initial selection is for all the objects at once.
  */
-public class ObjectEditSelectedGroup {
+public final class ObjectEditSelectedGroup {
     private final TrackConnection connection;
     private final List<SelectedObject> selection;
     private final long creationTime;
@@ -59,6 +59,35 @@ public class ObjectEditSelectedGroup {
             result.put(select.object, select.selected);
         }
         return result;
+    }
+
+    /**
+     * Gets the values of {@link #getSelection()} in order of when they are cycled.
+     *
+     * @return Selection states
+     */
+    public boolean[] getSelectionStates() {
+        boolean[] result = new boolean[selection.size()];
+        for (int i = 0; i < result.length; i++) {
+            result[i] = selection.get(i).selected;
+        }
+        return result;
+    }
+
+    /**
+     * Gets the first/single track object that is currently selected.
+     * Used for updating the UI for the selected track object when
+     * cycling through multiple of them.
+     *
+     * @return Selected TrackObject, or null if none are selected
+     */
+    public TrackObject getSingleSelection() {
+        for (SelectedObject select : selection) {
+            if (select.selected) {
+                return select.object;
+            }
+        }
+        return null;
     }
 
     /**

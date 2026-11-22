@@ -5,6 +5,8 @@ import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
+import com.bergerkiller.bukkit.common.block.InputDialogSubmitText;
+import com.bergerkiller.bukkit.common.inventory.CommonItemStack;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
@@ -14,7 +16,6 @@ import com.bergerkiller.bukkit.coasters.editor.PlayerEditState;
 import com.bergerkiller.bukkit.coasters.editor.history.ChangeCancelledException;
 import com.bergerkiller.bukkit.coasters.editor.history.HistoryChange;
 import com.bergerkiller.bukkit.coasters.editor.history.HistoryChangeCollection;
-import com.bergerkiller.bukkit.coasters.editor.signs.ui.InputDialogSubmitText;
 import com.bergerkiller.bukkit.coasters.signs.power.NamedPowerChannel;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNode;
 import com.bergerkiller.bukkit.coasters.tracks.TrackNodeAnimationState;
@@ -23,7 +24,6 @@ import com.bergerkiller.bukkit.coasters.tracks.TrackNodeState;
 import com.bergerkiller.bukkit.common.block.SignEditDialog;
 import com.bergerkiller.bukkit.common.nbt.CommonTagCompound;
 import com.bergerkiller.bukkit.common.utils.CommonUtil;
-import com.bergerkiller.bukkit.common.utils.ItemUtil;
 import com.bergerkiller.bukkit.common.utils.LogicUtil;
 import com.bergerkiller.bukkit.common.wrappers.ChatText;
 import com.bergerkiller.bukkit.tc.Util;
@@ -38,6 +38,27 @@ public class SignEditState {
 
     public SignEditState(PlayerEditState editState) {
         this.editState = editState;
+    }
+
+    /**
+     * Gets the sign the player is editing. This is the last sign of the last selected node.
+     *
+     * @return Last edited sign, or null if no sign is selected for editing
+     */
+    public TrackNodeSign getEditedSign() {
+        TrackNode lastEdited = editState.getLastEditedNode();
+        TrackNodeSign[] signs;
+        if (lastEdited != null && (signs = lastEdited.getSigns()).length > 0) {
+            return signs[signs.length - 1];
+        }
+
+        for (TrackNode node : editState.getEditedNodes()) {
+            if ((signs = node.getSigns()).length > 0) {
+                return signs[signs.length - 1];
+            }
+        }
+
+        return null;
     }
 
     private boolean handlePreClick(TrackNode node) {
@@ -111,7 +132,7 @@ public class SignEditState {
                         TCCoastersLocalization.SIGN_ADD_APPEND.message(player);
                     } else {
                         // Add a new sign to the node
-                        addSignToNode(editState.getHistory(), node, new TrackNodeSign(lines), true);
+                        addSignToNode(editState.getHistory(), node, new TrackNodeSign(lines), true, false);
                         TCCoastersLocalization.SIGN_ADD_SUCCESS.message(player);
                     }
                 } catch (ChangeCancelledException e) {
@@ -304,12 +325,16 @@ public class SignEditState {
     }
 
     private static String[] findInitialLines(ItemStack signItem) {
-        if (signItem != null) {
+        return findInitialLines(CommonItemStack.of(signItem));
+    }
+
+    private static String[] findInitialLines(CommonItemStack signItem) {
+        if (!signItem.isEmpty() && signItem.hasCustomData()) {
             try {
-                CommonTagCompound nbt = ItemUtil.getMetaTag(signItem, false);
-                if (nbt != null && nbt.containsKey("BlockEntityTag")) {
-                    CommonTagCompound blockTag = nbt.createCompound("BlockEntityTag");
-                    if (blockTag != null && "minecraft:sign".equals(blockTag.getValue("id", String.class))) {
+                CommonTagCompound nbt = signItem.getCustomData();
+                if (nbt.containsKey("BlockEntityTag")) {
+                    CommonTagCompound blockTag = nbt.getCompoundOrEmpty("BlockEntityTag");
+                    if ("minecraft:sign".equals(blockTag.getValue("id", String.class))) {
                         return new String[] {
                                 ChatText.fromJson(blockTag.getValue("Text1", "")).getMessage(),
                                 ChatText.fromJson(blockTag.getValue("Text2", "")).getMessage(),
@@ -418,14 +443,15 @@ public class SignEditState {
     }
 
     /**
-     * Replaces the sign in all selected nodes matching the sign with a replacement
+     * Replaces the sign in all selected nodes matching the sign with a replacement.
+     * Keeps previous other information of the sign, like added power channels.
      *
      * @param toReplace Sign whose lines to match and replace
      * @param sign Sign replacement
      * @return True if one or more signs were replaced, False if none matched
      * @throws ChangeCancelledException
      */
-    public boolean replaceSign(TrackNodeSign toReplace, TrackNodeSign sign) throws ChangeCancelledException {
+    public boolean replaceSignText(TrackNodeSign toReplace, TrackNodeSign sign) throws ChangeCancelledException {
         // Deselect nodes we cannot edit
         editState.deselectLockedNodes();
 
@@ -441,7 +467,14 @@ public class SignEditState {
             TrackNodeSign[] new_signs = node.getSigns().clone();
             for (int i = 0; i < new_signs.length; i++) {
                 if (new_signs[i].hasSameLines(toReplace)) {
+                    TrackNodeSign oldSign = new_signs[i];
                     new_signs[i] = addedSign = sign.clone();
+                    for (NamedPowerChannel inputChannel : oldSign.getInputPowerChannels()) {
+                        addedSign.addInputPowerChannel(inputChannel);
+                    }
+                    for (NamedPowerChannel outputChannel : oldSign.getOutputPowerChannels()) {
+                        addedSign.addOutputPowerChannel(outputChannel);
+                    }
                 }
             }
             if (addedSign == null) {
@@ -470,6 +503,41 @@ public class SignEditState {
     }
 
     public void addSign(TrackNodeSign sign) throws ChangeCancelledException {
+        addOrSetSign(sign, false);
+    }
+
+    /**
+     * Adds or sets a sign on all selected nodes. If addSign is true, the sign is added to the previous signs on the node.
+     * If addSign is false, the previous signs are cleared first. The input sign is cloned before setting, so there is no risk
+     * of multiple nodes referencing the same sign.
+     *
+     * @param sign TrackNodeSign
+     * @param replaceExistingSigns True to clear and set the sign, false to add the sign and keep previous signs
+     * @throws ChangeCancelledException If permission issues occur
+     */
+    public void addOrSetSign(TrackNodeSign sign, boolean replaceExistingSigns) throws ChangeCancelledException {
+        // Deselect nodes we cannot edit
+        editState.deselectLockedNodes();
+
+        // Failure if no nodes are selected
+        if (!editState.hasEditedNodes()) {
+            return;
+        }
+
+        addOrSetSign(sign, editState.getHistory().addChangeGroup(), replaceExistingSigns);
+    }
+
+    /**
+     * Adds or sets a sign on all selected nodes. If addSign is true, the sign is added to the previous signs on the node.
+     * If addSign is false, the previous signs are cleared first. The input sign is cloned before setting, so there is no risk
+     * of multiple nodes referencing the same sign.
+     *
+     * @param sign TrackNodeSign
+     * @param changes HistoryChange to record the operation into (for undo)
+     * @param replaceExistingSigns True to clear and set the sign, false to add the sign and keep previous signs
+     * @throws ChangeCancelledException If permission issues occur
+     */
+    public void addOrSetSign(TrackNodeSign sign, HistoryChange changes, boolean replaceExistingSigns) throws ChangeCancelledException {
         // Deselect nodes we cannot edit
         editState.deselectLockedNodes();
 
@@ -479,9 +547,8 @@ public class SignEditState {
         }
 
         boolean firedEvent = false;
-        HistoryChange changes = editState.getHistory().addChangeGroup();
         for (TrackNode node : editState.getEditedNodes()) {
-            addSignToNode(changes, node, sign, !firedEvent);
+            addSignToNode(changes, node, sign.clone(), !firedEvent, replaceExistingSigns);
             firedEvent = true;
         }
     }
@@ -494,12 +561,17 @@ public class SignEditState {
      * @param sign Sign that was added
      * @param interactive Whether this is an interactive build. If true, a successful build message is sent.
      *                    If false, only permission/error related messages are sent.
-     * @throws ChangeCancelledException
+     * @param replaceExistingSigns True to clear and set the sign, false to add the sign and keep previous signs
+     * @throws ChangeCancelledException If the player lacks permission and the change was canceled
      */
-    private void addSignToNode(HistoryChangeCollection changes, TrackNode node, TrackNodeSign sign, boolean interactive) throws ChangeCancelledException {
+    private void addSignToNode(HistoryChangeCollection changes, TrackNode node, TrackNodeSign sign, boolean interactive, boolean replaceExistingSigns) throws ChangeCancelledException {
         TrackNodeSign node_sign = sign.clone();
         TrackNodeSign[] old_signs = node.getSigns();
-        setSignsForNode(changes, node, LogicUtil.appendArrayElement(node.getSigns(), node_sign));
+        if (replaceExistingSigns) {
+            setSignsForNode(changes, node, new TrackNodeSign[] { node_sign });
+        } else {
+            setSignsForNode(changes, node, LogicUtil.appendArrayElement(node.getSigns(), node_sign));
+        }
 
         // Fire a sign build event with the sign's custom sign
         if (!node_sign.fireBuildEvent(editState.getPlayer(), interactive)) {

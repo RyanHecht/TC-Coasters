@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
+import com.bergerkiller.bukkit.common.Common;
+import com.bergerkiller.bukkit.common.wrappers.Brightness;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.Vector;
 
@@ -28,6 +30,7 @@ import com.bergerkiller.bukkit.common.wrappers.BlockData;
  */
 public class StringArrayBuffer implements Iterator<String> {
     private static final NumberFormat DEFAULT_NUMBER_FORMAT = new DecimalFormat("0.0#####", DecimalFormatSymbols.getInstance(Locale.ENGLISH));
+    private static final boolean CAN_WRITE_NULL_ITEM = Common.hasCapability("Common:JSONSerializer:NullItemStack");
 
     private final JsonSerializer jsonSerializer = new JsonSerializer();
     private String[] buffer = new String[10];
@@ -128,6 +131,24 @@ public class StringArrayBuffer implements Iterator<String> {
     }
 
     /**
+     * Sets the next Brightness value. Encodes it as string "UNSET" if unset, or as
+     * two hexadecimal values for blocklight and skylight.
+     *
+     * @param brightness Brightness value
+     * @see #nextBrightness()
+     */
+    public void putBrightness(Brightness brightness) {
+        if (brightness == Brightness.UNSET) {
+            put("UNSET");
+        } else {
+            StringBuilder str = new StringBuilder(2);
+            str.append(Character.forDigit(brightness.blockLight(), 16));
+            str.append(Character.forDigit(brightness.skyLight(), 16));
+            put(str.toString());
+        }
+    }
+
+    /**
      * Sets the next UUID value
      *
      * @param uuid The UUID value to set
@@ -142,6 +163,10 @@ public class StringArrayBuffer implements Iterator<String> {
      * @param item The ItemStack value to set
      */
     public void putItemStack(ItemStack item) {
+        if (!CAN_WRITE_NULL_ITEM && item == null) {
+            put("null"); // Until fixed in BKCommonLib
+        }
+
         put(jsonSerializer.itemStackToJson(item).replace(" ", "\\u0020"));
     }
 
@@ -235,7 +260,11 @@ public class StringArrayBuffer implements Iterator<String> {
      */
     public ItemStack nextItemStack() throws SyntaxException {
         try {
-            return this.jsonSerializer.fromJsonToItemStack(next());
+            String json = next();
+            if (!CAN_WRITE_NULL_ITEM && "null".equals(json)) {
+                return null; // Until patched in BKCommonLib
+            }
+            return this.jsonSerializer.fromJsonToItemStack(json);
         } catch (JsonSyntaxException e) {
             throw createSyntaxException("Invalid ItemStack Json(" + e.getMessage() + ")");
         }
@@ -280,7 +309,7 @@ public class StringArrayBuffer implements Iterator<String> {
      * Gets the next Double value
      * 
      * @return next Double value
-     * @throws SyntaxException if the value is not an Double
+     * @throws SyntaxException if the value is not a Double or is NaN
      */
     public double nextDouble() throws SyntaxException {
         String value = next();
@@ -288,7 +317,11 @@ public class StringArrayBuffer implements Iterator<String> {
             throw createSyntaxException("Empty value, number expected");
         }
         try {
-            return Double.parseDouble(value);
+            double parsed = Double.parseDouble(value);
+            if (Double.isNaN(parsed)) {
+                throw createSyntaxException("Value is not a number: " + value).setColumn(this.index);
+            }
+            return parsed;
         } catch (NumberFormatException ex) {
             // TCC Bug - wrote out 1,555.23 as a number sometimes
             // Fixed by trimming out the ,. Gets fixed as it re-saves.
@@ -318,6 +351,33 @@ public class StringArrayBuffer implements Iterator<String> {
         } catch (NumberFormatException ex) {
             throw createSyntaxException("Value is not a number: " + value);
         }
+    }
+
+    /**
+     * Gets the next brightness value. This is a combination of two hexadecimal
+     * numbers for blocklight and skylight respectively. If unset, stores string
+     * "UNSET".
+     *
+     * @return Brightness value
+     * @throws SyntaxException
+     */
+    public Brightness nextBrightness() throws SyntaxException {
+        String value = next();
+        if (value.isEmpty()) {
+            throw createSyntaxException("Empty value, brightness expected");
+        } else if (value.equals("-1") || value.equalsIgnoreCase("unset")) {
+            return Brightness.UNSET;
+        } else if (value.length() != 2) {
+            throw createSyntaxException("Invalid brightness value: " + value);
+        }
+
+        int blockLight = Character.digit(value.charAt(0), 16);
+        int skyLight = Character.digit(value.charAt(1), 16);
+        if (blockLight == -1 || skyLight == -1) {
+            throw createSyntaxException("Invalid brightness value: " + value);
+        }
+
+        return Brightness.blockAndSkyLight(blockLight, skyLight);
     }
 
     /**

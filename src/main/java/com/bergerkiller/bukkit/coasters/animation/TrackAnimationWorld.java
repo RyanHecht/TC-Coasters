@@ -3,12 +3,20 @@ package com.bergerkiller.bukkit.coasters.animation;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import com.bergerkiller.bukkit.coasters.signs.actions.TrackAnimationListener;
+import com.bergerkiller.bukkit.tc.controller.components.RailPiece;
+import com.bergerkiller.bukkit.tc.events.SignActionEvent;
+import com.bergerkiller.bukkit.tc.signactions.SignAction;
+import com.bergerkiller.bukkit.tc.signactions.SignActionType;
 import org.bukkit.util.Vector;
 
 import com.bergerkiller.bukkit.coasters.tracks.TrackConnection;
@@ -46,7 +54,11 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
     }
 
     public void animate(TrackNode node, TrackNodeState target, TrackConnectionState[] connections, double duration) {
-        _animations.put(node, new TrackAnimation(node, target, connections, MathUtil.floor(duration * 20.0)));
+        animate("", node, target, connections, duration);
+    }
+
+    public void animate(String animationName, TrackNode node, TrackNodeState target, TrackConnectionState[] connections, double duration) {
+        _animations.put(node, new TrackAnimation(animationName, node, target, connections, MathUtil.floor(duration * 20.0)));
     }
 
     @Override
@@ -69,6 +81,22 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
                     });
                 }
             }
+        }
+
+        // Toggle up all the levers on all tcc animate signs at the current rail blocks being animated
+        // In case the animation changes these signs later, doing this now avoids stuck-up levers
+        {
+            Map<IntVector3, RailAnimationChangeTracker> railAnimationsStarted = new HashMap<>();
+            for (TrackAnimation anim : _animations.values()) {
+                if (anim.isAtStart()) {
+                    RailAnimationChangeTracker tracker = railAnimationsStarted.computeIfAbsent(
+                            anim.node.getRailBlock(true),
+                            this::initRailAnimationChangeTracker);
+
+                    tracker.add(anim);
+                }
+            }
+            railAnimationsStarted.values().forEach(RailAnimationChangeTracker::fireStarted);
         }
 
         // Run the animations
@@ -96,9 +124,13 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
                 // Set to target
                 anim.node.setState(anim.target);
 
-                // Delete all connections that have existed for this node
+                // Delete all connections that have existed for this node that no longer exist
                 if (anim.connections != null) {
-                    getWorld().getTracks().disconnectAll(anim.node, false);
+                    for (TrackConnection connection : anim.node.getConnections()) {
+                        if (!anim.shouldKeepConnection(connection)) {
+                            connection.remove();
+                        }
+                    }
                 }
             } else {
                 // Update using lerp
@@ -114,14 +146,24 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
             }
         }
 
+        // Track finished animations, they can toggle levers on animate signs back down
+        List<TrackAnimation> endedAnimations = new ArrayList<>();
+
         // Create connections at the end of the animations
         Iterator<TrackAnimation> anim_iter;
         anim_iter = _animations.values().iterator();
         while (anim_iter.hasNext()) {
             TrackAnimation anim = anim_iter.next();
             if (anim.isAtEnd()) {
+                endedAnimations.add(anim);
+
                 if (anim.connections != null) {
                     for (TrackConnectionState connection : anim.connections) {
+                        //TODO: Why is this even happening?
+                        if (connection.node_a.isReference(connection.node_b)) {
+                            continue;
+                        }
+
                         if (connection.isConnected(anim.node)) {
                             TrackConnection tc = getWorld().getTracks().connect(connection, false);
                             if (tc != null) {
@@ -140,11 +182,17 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
         try {
             for (Map.Entry<TrackConnection, TrackConnectionState> addedConnection : _finishedConnections.entrySet()) {
                 addedConnection.getKey().onShapeUpdated();
-                addedConnection.getKey().addAllObjects(addedConnection.getValue());
+                addedConnection.getKey().setAllObjects(addedConnection.getValue());
             }
         } finally {
             _finishedConnections.clear();
         }
+
+        // After moving the nodes around again, also rebuild the track information
+        // This is basically done twice per tick when animations play, because it needs
+        // track information prior to calculate where members are, and after to make
+        // sure physics update correctly.
+        this.getWorld().getTracks().updateAll();
 
         // Compute new position on the new, adjusted tracks
         for (TrackMemberState state : members.values()) {
@@ -161,6 +209,13 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
                 connectionPoints.put(state.connection, points);
             }
 
+            // Reverse points if wrong
+            double distanceDiffA = points.get(0).distanceSquared(state.posA) + points.get(points.size() - 1).distanceSquared(state.posB);
+            double distanceDiffB = points.get(0).distanceSquared(state.posB) + points.get(points.size() - 1).distanceSquared(state.posA);
+            if (distanceDiffB < distanceDiffA) {
+                Collections.reverse(points);
+            }
+
             // Use theta to compute a new x/y/z
             // System.out.println("STATE THETA: " + state.theta);
             double remaining_distance = state.theta * getTotalDistance(points);
@@ -168,7 +223,7 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
             RailPath.Point p_prev = p_iter.next();
             while (true) {
                 RailPath.Point p = p_iter.next();
-                
+
                 double dx = p.x - p_prev.x;
                 double dy = p.y - p_prev.y;
                 double dz = p.z - p_prev.z;
@@ -178,15 +233,19 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
                     double x = p_prev.x + theta * dx;
                     double y = p_prev.y + theta * dy;
                     double z = p_prev.z + theta * dz;
+
                     applyPosition(state.member, x, y, z);
 
                     // For debug: verify there is no significant difference in theta before/after adjustment
                     /*
-                    TrackMemberState new_state = computeState(state.member, state.connection, points, getTotalDistance(points));
-                    if (Math.abs(new_state.theta - state.theta) > 1e-4) {
+                    TrackMemberState new_state = computeMemberStates(state.connection, points, Stream.of(state.member)
+                            .map(MemberOnPath::new)
+                            .collect(Collectors.toList()))
+                            .findFirst().orElse(null);
+                    if (new_state != null && Math.abs(new_state.theta - state.theta) > 1e-4) {
                         System.out.println("HUGE THETA DIFF " + (new_state.theta - state.theta));
                     }
-                    */
+                     */
 
                     break;
                 }
@@ -196,11 +255,36 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
             }
         }
 
-        // After moving the nodes around again, also rebuild the track information
-        // This is basically done twice per tick when animations play, because it needs
-        // track information prior to calculate where members are, and after to make
-        // sure physics update correctly.
-        this.getWorld().getTracks().updateAll();
+        // Fire off sign events after the animations have concluded
+        // Must be done at the very end, because the active signs may have changed after the animation
+        if (!endedAnimations.isEmpty()) {
+            Map<IntVector3, RailAnimationChangeTracker> railAnimationsEnded = new HashMap<>();
+            for (TrackAnimation anim : endedAnimations) {
+                RailAnimationChangeTracker tracker = railAnimationsEnded.computeIfAbsent(
+                        anim.node.getRailBlock(true),
+                        this::initRailAnimationChangeTracker);
+                tracker.add(anim);
+            }
+            railAnimationsEnded.values().forEach(RailAnimationChangeTracker::fireEnded);
+        }
+    }
+
+    private RailAnimationChangeTracker initRailAnimationChangeTracker(IntVector3 rail) {
+        RailPiece railPiece = RailPiece.create(getPlugin().getRailType(), rail.toBlock(getBukkitWorld()));
+        List<RailLookup.TrackedSign> signsWithListeners = Collections.emptyList();
+        for (RailLookup.TrackedSign sign : railPiece.signs()) {
+            if (sign.getAction() instanceof TrackAnimationListener) {
+                if (signsWithListeners.isEmpty()) {
+                    signsWithListeners = new ArrayList<>();
+                }
+                signsWithListeners.add(sign);
+            }
+        }
+        if (signsWithListeners.isEmpty()) {
+            return RailAnimationChangeTracker.INACTIVE;
+        } else {
+            return new RailAnimationChangeTrackerActive(signsWithListeners);
+        }
     }
 
     private void loadPoints(TrackConnection connection) {
@@ -222,90 +306,57 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
         OfflineBlock rail_b = world.getBlockAt(connection.getNodeB().getRailBlock(true));
         Stream<MinecartMember<?>> members;
         if (rail_a.equals(rail_b)) {
-            Collection<MinecartMember<?>> members_a = RailLookup.findMembersOnRail(rail_a);
-            if (members_a.isEmpty()) {
-                return Stream.empty();
-            }
-            members = members_a.stream();
+            members = RailLookup.findMembersOnRail(rail_a).stream();
         } else {
             Collection<MinecartMember<?>> members_a = RailLookup.findMembersOnRail(rail_a);
             Collection<MinecartMember<?>> members_b = RailLookup.findMembersOnRail(rail_b);
-            if (members_a.isEmpty() && members_b.isEmpty()) {
-                return Stream.empty();
-            }
             members = Stream.concat(members_a.stream(), members_b.stream());
+        }
+
+        // Prepares members whose path is being calculated
+        List<MemberOnPath> membersOnPath = members
+                .filter(member -> !member.isUnloaded() && !member.getEntity().isRemoved())
+                .map(MemberOnPath::new)
+                .collect(Collectors.toList());
+        if (membersOnPath.isEmpty()) {
+            return Stream.empty();
         }
 
         // Compute the exact path between the two nodes right now
         loadPoints(connection);
-        if (_pointsCache.size() < 2) {
+        return computeMemberStates(connection, _pointsCache, membersOnPath);
+    }
+
+    private Stream<TrackMemberState> computeMemberStates(TrackConnection connection, List<RailPath.Point> points, List<MemberOnPath> membersOnPath) {
+        if (points.size() < 2) {
             return Stream.empty(); // what?!
         }
 
-        // Compute total length of the path
-        final double total_len = getTotalDistance(_pointsCache);
-
-        // Go by all found members and compute their theta on this path
-        return members.map(member -> {
-            return computeState(member, connection, _pointsCache, total_len);
-        });
-    }
-
-    private static TrackMemberState computeState(MinecartMember<?> member, TrackConnection connection, List<RailPath.Point> points, double total_len) {
-        if (member.isUnloaded() || member.getEntity().isRemoved()) {
-            return new TrackMemberState(member, connection, 0.0);
-        }
-
-        Vector pos = member.getEntity().loc.vector();
-        Iterator<RailPath.Point> p_iter = points.iterator();
-        RailPath.Point p_prev = p_iter.next();
-        double len_sum = 0.0;
-        double lowest_distance = Double.MAX_VALUE;
-        double best_len = 0.0;
-        while (p_iter.hasNext()) {
-            RailPath.Point p = p_iter.next();
-
-            double dx = p.x - p_prev.x;
-            double dy = p.y - p_prev.y;
-            double dz = p.z - p_prev.z;
-            double ls = (dx*dx) + (dy*dy) + (dz*dz);
-            double len = Math.sqrt(ls);
-            double theta = -(((p_prev.x - pos.getX()) * dx + (p_prev.y - pos.getY()) * dy + (p_prev.z - pos.getZ()) * dz) / ls);
-
-            if (theta <= 0.0) {
-                double dist_from_point = -(theta * len);
-                if (dist_from_point < lowest_distance) {
-                    lowest_distance = dist_from_point;
-                    best_len = len_sum;
-                }
-            } else if (theta >= 1.0) {
-                double dist_from_point = (theta - 1.0) * len;
-                if (dist_from_point < lowest_distance) {
-                    lowest_distance = dist_from_point;
-                    best_len = len_sum + len;
-                }
-            } else {
-                best_len = len_sum + theta * len;
-                break;
+        // Iterate all segments of the path
+        // Calculate the total length of the path
+        // Then, also calculate the (best matching) distance to reaching each member
+        double calc_total_len = 0.0;
+        for (MatchableSegment s : SegmentIterable.of(points, MatchableSegment::new)) {
+            // Track and match best position on the path
+            for (MemberOnPath m : membersOnPath) {
+                m.match(s, calc_total_len);
             }
 
-            len_sum += len;
-            p_prev = p;
+            // Accumulate total length
+            calc_total_len += s.len;
         }
+        final double total_len = calc_total_len;
 
-        return new TrackMemberState(member, connection, best_len / total_len);
+        // Turn into TrackMemberState
+        return membersOnPath.stream()
+                .filter(MemberOnPath::isMatched)
+                .map(m -> new TrackMemberState(m.member, connection, m.bestPathDistance / total_len));
     }
-    
+
     private static double getTotalDistance(List<RailPath.Point> points) {
         double len_sum = 0.0;
-        Iterator<RailPath.Point> p_iter = points.iterator();
-        RailPath.Point p_prev = p_iter.next();
-        while (p_iter.hasNext()) {
-            RailPath.Point p = p_iter.next();
-            len_sum += MathUtil.distance(
-                    p_prev.x, p_prev.y, p_prev.z,
-                    p.x, p.y, p.z);
-            p_prev = p;
+        for (Segment s : SegmentIterable.of(points, Segment::new)) {
+            len_sum += s.len;
         }
         return len_sum;
     }
@@ -314,5 +365,236 @@ public class TrackAnimationWorld implements CoasterWorldComponent {
         CommonEntity<?> entity = member.getEntity();
         entity.setPosition(x, y, z);
         entity.setPositionChanged(true);
+    }
+
+    // Keeps track on what segment and where a member is (best) located
+    private static class MemberOnPath {
+        public final MinecartMember<?> member;
+        public final Vector position;
+        public double bestDistanceSq = (0.2 * 0.2); // Minecart must be at most 0.2 block away from the path being moved
+        public double bestPathDistance = Double.NaN;
+
+        public MemberOnPath(MinecartMember<?> member) {
+            this.member = member;
+            this.position = member.getEntity().loc.vector();
+        }
+
+        public boolean isMatched() {
+            return !Double.isNaN(bestPathDistance);
+        }
+
+        public void match(MatchableSegment segment, double pathDistance) {
+            double theta = segment.calcTheta(position);
+            if (theta < 0.0 || theta > 1.0) {
+                return;
+            }
+
+            Vector posOnPath = segment.getPosition(theta);
+            double distSq = posOnPath.distanceSquared(this.position);
+            if (distSq < bestDistanceSq) {
+                bestDistanceSq = distSq;
+                bestPathDistance = pathDistance + theta * segment.len;
+            }
+        }
+    }
+
+    // Iterates a List of PathPoint as Segments
+    private static class SegmentIterable<S> implements Iterable<S> {
+        private final List<RailPath.Point> points;
+        private final BiFunction<RailPath.Point, RailPath.Point, S> func;
+
+        public static <S> SegmentIterable<S> of(List<RailPath.Point> points, BiFunction<RailPath.Point, RailPath.Point, S> func) {
+            return new SegmentIterable<>(points, func);
+        }
+
+        private SegmentIterable(List<RailPath.Point> points, BiFunction<RailPath.Point, RailPath.Point, S> func) {
+            this.points = points;
+            this.func = func;
+        }
+
+        @Override
+        public Iterator<S> iterator() {
+            return new SegmentIterator<>(points.iterator(), func);
+        }
+
+        private static class SegmentIterator<S> implements Iterator<S> {
+            private final Iterator<RailPath.Point> iter;
+            private final BiFunction<RailPath.Point, RailPath.Point, S> func;
+            private RailPath.Point prev;
+
+            public SegmentIterator(Iterator<RailPath.Point> iter, BiFunction<RailPath.Point, RailPath.Point, S> func) {
+                this.iter = iter;
+                this.func = func;
+                this.prev = iter.hasNext() ? iter.next() : null;
+            }
+
+            @Override
+            public boolean hasNext() {
+                return iter.hasNext();
+            }
+
+            @Override
+            public S next() {
+                RailPath.Point prev = this.prev;
+                RailPath.Point next = iter.next();
+                this.prev = next;
+                return func.apply(prev, next);
+            }
+        }
+    }
+
+    // Includes mot_dt (as in RailPath.Segment) for theta and path distance calculations
+    private static class MatchableSegment extends Segment {
+        public final double mot_dt_x, mot_dt_y, mot_dt_z;
+
+        public MatchableSegment(RailPath.Point prev, RailPath.Point curr) {
+            super(prev, curr);
+            double inv_len_sq = 1.0 / this.len_sq;
+            this.mot_dt_x = this.dx * inv_len_sq;
+            this.mot_dt_y = this.dy * inv_len_sq;
+            this.mot_dt_z = this.dz * inv_len_sq;
+        }
+
+        public final double calcTheta(Vector pos) {
+            return -((this.x - pos.getX()) * mot_dt_x + (this.y - pos.getY()) * mot_dt_y + (this.z - pos.getZ()) * mot_dt_z);
+        }
+
+        public Vector getPosition(double theta) {
+            if (theta <= 0.0) {
+                return new Vector(x, y, z);
+            } else if (theta >= 1.0) {
+                return new Vector(x + dx, y + dy, z + dz);
+            } else {
+                return new Vector(x + theta * dx, y + theta * dy, z + theta * dz);
+            }
+        }
+    }
+
+    // Simplified version of RailPath.Segment for point-on-path calculations
+    private static class Segment {
+        public final double x, y, z;
+        public final double dx, dy, dz;
+        public final double len_sq;
+        public final double len;
+        private Vector mot_dt;
+
+        public Segment(RailPath.Point prev, RailPath.Point curr) {
+            this.x = prev.x;
+            this.y = prev.y;
+            this.z = prev.z;
+            this.dx = curr.x - prev.x;
+            this.dy = curr.y - prev.y;
+            this.dz = curr.z - prev.z;
+            this.len_sq = (dx * dx + dy * dy + dz * dz);
+            this.len = Math.sqrt(this.len_sq);
+        }
+    }
+
+    private interface RailAnimationChangeTracker {
+        /** Used when the rails do not have any sign actions on it that are informed of animation changes */
+        RailAnimationChangeTracker INACTIVE = new RailAnimationChangeTracker() {
+            @Override
+            public void add(TrackAnimation animation) {
+                //No-op
+            }
+
+            @Override
+            public void fireStarted() {
+                //No-op
+            }
+
+            @Override
+            public void fireEnded() {
+                //No-op
+            }
+        };
+
+        /**
+         * Notify of the initial or another animation on this same track that was started or finished.
+         *
+         * @param animation TrackAnimation
+         */
+        void add(TrackAnimation animation);
+
+        /**
+         * Fires off the animation-start event for all animations added
+         */
+        void fireStarted();
+
+        /**
+         * Fires off the animation-end event for all animations added
+         */
+        void fireEnded();
+    }
+
+    private static class RailAnimationChangeTrackerActive implements RailAnimationChangeTracker {
+        public final List<RailLookup.TrackedSign> signs;
+        public List<AnimationChangeList> changes = new ArrayList<>();
+
+        public RailAnimationChangeTrackerActive(List<RailLookup.TrackedSign> signs) {
+            this.signs = signs;
+        }
+
+        @Override
+        public void add(TrackAnimation animation) {
+            for (AnimationChangeList list : changes) {
+                if (list.tryMerge(animation)) {
+                    return;
+                }
+            }
+
+            changes.add(new AnimationChangeList(animation));
+        }
+
+        @Override
+        public void fireStarted() {
+            for (RailLookup.TrackedSign sign : signs) {
+                SignAction action = sign.getAction();
+                if (action instanceof TrackAnimationListener) {
+                    SignActionEvent event = sign.createEvent(SignActionType.NONE);
+                    for (AnimationChangeList list : changes) {
+                        ((TrackAnimationListener) action).onTrackAnimationBegin(
+                                event,
+                                list.name,
+                                list.animationStates);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void fireEnded() {
+            for (RailLookup.TrackedSign sign : signs) {
+                SignAction action = sign.getAction();
+                if (action instanceof TrackAnimationListener) {
+                    SignActionEvent event = sign.createEvent(SignActionType.NONE);
+                    for (AnimationChangeList list : changes) {
+                        ((TrackAnimationListener) action).onTrackAnimationEnd(
+                                event,
+                                list.name,
+                                list.animationStates);
+                    }
+                }
+            }
+        }
+    }
+
+    private static class AnimationChangeList {
+        public final String name;
+        public final List<TrackAnimation> animationStates = new ArrayList<>();
+
+        public AnimationChangeList(TrackAnimation animation) {
+            this.name = animation.name;
+            this.animationStates.add(animation);
+        }
+
+        public boolean tryMerge(TrackAnimation animation) {
+            if (this.name.equals(animation.name)) {
+                this.animationStates.add(animation);
+                return true;
+            } else {
+                return false;
+            }
+        }
     }
 }
